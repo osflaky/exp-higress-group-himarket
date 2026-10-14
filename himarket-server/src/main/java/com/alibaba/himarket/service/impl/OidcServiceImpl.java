@@ -1,0 +1,449 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package com.alibaba.himarket.service.impl;
+
+import com.alibaba.himarket.core.constant.CommonConstants;
+import com.alibaba.himarket.core.constant.IdpConstants;
+import com.alibaba.himarket.core.constant.Resources;
+import com.alibaba.himarket.core.exception.BusinessException;
+import com.alibaba.himarket.core.exception.ErrorCode;
+import com.alibaba.himarket.core.security.ContextHolder;
+import com.alibaba.himarket.dto.params.developer.CreateExternalDeveloperParam;
+import com.alibaba.himarket.dto.result.common.AuthResult;
+import com.alibaba.himarket.dto.result.developer.DeveloperResult;
+import com.alibaba.himarket.dto.result.idp.IdpResult;
+import com.alibaba.himarket.dto.result.idp.IdpState;
+import com.alibaba.himarket.dto.result.idp.IdpTokenResult;
+import com.alibaba.himarket.dto.result.portal.PortalResult;
+import com.alibaba.himarket.service.DeveloperService;
+import com.alibaba.himarket.service.OidcService;
+import com.alibaba.himarket.service.PortalService;
+import com.alibaba.himarket.service.TokenService;
+import com.alibaba.himarket.service.gateway.factory.HTTPClientFactory;
+import com.alibaba.himarket.support.common.Strings;
+import com.alibaba.himarket.support.enums.DeveloperAuthType;
+import com.alibaba.himarket.support.enums.GrantType;
+import com.alibaba.himarket.support.portal.AuthCodeConfig;
+import com.alibaba.himarket.support.portal.IdentityMapping;
+import com.alibaba.himarket.support.portal.OidcConfig;
+import com.alibaba.himarket.utils.JsonUtil;
+import com.fasterxml.jackson.core.type.TypeReference;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.UUID;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.stereotype.Service;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.client.RestTemplate;
+import org.springframework.web.util.UriComponentsBuilder;
+
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class OidcServiceImpl implements OidcService {
+
+    private final PortalService portalService;
+
+    private final TokenService tokenService;
+
+    private final DeveloperService developerService;
+
+    private final RestTemplate restTemplate = HTTPClientFactory.createRestTemplate();
+
+    private final ContextHolder contextHolder;
+
+    @Override
+    public String buildAuthorizationUrl(
+            String provider, String apiPrefix, HttpServletRequest request) {
+        OidcConfig oidcConfig = findOidcConfig(provider);
+        AuthCodeConfig authCodeConfig = oidcConfig.getAuthCodeConfig();
+
+        // State saves context info
+        String state = buildState(provider, apiPrefix);
+        String redirectUri = buildRedirectUri(request, authCodeConfig);
+
+        // Redirect URL
+        String authUrl =
+                UriComponentsBuilder.fromUriString(authCodeConfig.getAuthorizationEndpoint())
+                        // Authorization code mode
+                        .queryParam(IdpConstants.RESPONSE_TYPE, IdpConstants.CODE)
+                        .queryParam(IdpConstants.CLIENT_ID, authCodeConfig.getClientId())
+                        .queryParam(IdpConstants.REDIRECT_URI, redirectUri)
+                        .queryParam(IdpConstants.SCOPE, authCodeConfig.getScopes())
+                        .queryParam(IdpConstants.STATE, state)
+                        .build()
+                        .toUriString();
+
+        log.info("Generated OIDC authorization URL, url={}", authUrl);
+        return authUrl;
+    }
+
+    @Override
+    public AuthResult handleCallback(
+            String code, String state, HttpServletRequest request, HttpServletResponse response) {
+        log.info("Processing OIDC callback, code={}, state={}", code, state);
+
+        // Parse state to get provider info
+        IdpState idpState = parseState(state);
+        String provider = idpState.getProvider();
+
+        if (Strings.isBlank(provider)) {
+            throw new BusinessException(ErrorCode.INVALID_REQUEST, "Missing OIDC provider");
+        }
+
+        OidcConfig oidcConfig = findOidcConfig(provider);
+
+        // Request token with authorization code
+        IdpTokenResult tokenResult = requestToken(code, oidcConfig, request);
+
+        // Get user info, prefer ID Token, fallback to UserInfo endpoint
+        Map<String, Object> userInfo = getUserInfo(tokenResult, oidcConfig);
+        log.info("Resolved OIDC user info, userInfo={}", userInfo);
+
+        // Handle user authentication
+        String developerId = createOrGetDeveloper(userInfo, oidcConfig);
+        String accessToken = tokenService.generateDeveloperToken(developerId);
+
+        return AuthResult.of(accessToken, tokenService.getTokenExpiresIn());
+    }
+
+    @Override
+    public List<IdpResult> getAvailableProviders() {
+        PortalResult portal = portalService.getPortal(contextHolder.getPortal());
+        if (portal == null || portal.getPortalSettingConfig() == null) {
+            return Collections.emptyList();
+        }
+
+        List<OidcConfig> oidcConfigs = portal.getPortalSettingConfig().getOidcConfigs();
+        if (oidcConfigs == null) {
+            return Collections.emptyList();
+        }
+
+        List<IdpResult> providers = new ArrayList<>();
+        for (OidcConfig config : oidcConfigs) {
+            if (!config.isEnabled()) {
+                continue;
+            }
+
+            providers.add(
+                    IdpResult.builder()
+                            .provider(config.getProvider())
+                            .displayName(config.getName())
+                            .build());
+        }
+        return providers;
+    }
+
+    private String buildRedirectUri(HttpServletRequest request, AuthCodeConfig authCodeConfig) {
+        if (Strings.isNotBlank(authCodeConfig.getRedirectUri())) {
+            return authCodeConfig.getRedirectUri();
+        }
+
+        String scheme = request.getScheme();
+        //        String serverName = "localhost";
+        //        int serverPort = 5173;
+        String serverName = request.getServerName();
+        int serverPort = request.getServerPort();
+
+        String baseUrl = scheme + "://" + serverName;
+        if (serverPort != CommonConstants.HTTP_PORT && serverPort != CommonConstants.HTTPS_PORT) {
+            baseUrl += ":" + serverPort;
+        }
+
+        // Redirect to frontend callback
+        return baseUrl + "/oidc/callback";
+    }
+
+    private OidcConfig findOidcConfig(String provider) {
+        PortalResult portal = portalService.getPortal(contextHolder.getPortal());
+        if (portal != null && portal.getPortalSettingConfig() != null) {
+            List<OidcConfig> oidcConfigs = portal.getPortalSettingConfig().getOidcConfigs();
+            if (oidcConfigs != null) {
+                for (OidcConfig config : oidcConfigs) {
+                    if (provider.equals(config.getProvider()) && config.isEnabled()) {
+                        return config;
+                    }
+                }
+            }
+        }
+
+        throw new BusinessException(ErrorCode.NOT_FOUND, Resources.OIDC_CONFIG, provider);
+    }
+
+    private String buildState(String provider, String apiPrefix) {
+        IdpState state =
+                IdpState.builder()
+                        .provider(provider)
+                        .timestamp(System.currentTimeMillis())
+                        .nonce(UUID.randomUUID().toString().replace("-", ""))
+                        .apiPrefix(apiPrefix)
+                        .build();
+        return Base64.getEncoder()
+                .encodeToString(JsonUtil.toJson(state).getBytes(StandardCharsets.UTF_8));
+    }
+
+    private IdpState parseState(String encodedState) {
+        String stateJson =
+                new String(Base64.getDecoder().decode(encodedState), StandardCharsets.UTF_8);
+        IdpState idpState = JsonUtil.parse(stateJson, IdpState.class);
+
+        // Validate timestamp, 10 minutes validity
+        if (idpState.getTimestamp() != null) {
+            long currentTime = System.currentTimeMillis();
+            if (currentTime - idpState.getTimestamp() > 10 * 60 * 1000) {
+                throw new BusinessException(ErrorCode.INVALID_REQUEST, "Request has expired");
+            }
+        }
+
+        return idpState;
+    }
+
+    private IdpTokenResult requestToken(
+            String code, OidcConfig oidcConfig, HttpServletRequest request) {
+        AuthCodeConfig authCodeConfig = oidcConfig.getAuthCodeConfig();
+        String redirectUri = buildRedirectUri(request, authCodeConfig);
+
+        MultiValueMap<String, String> params = new LinkedMultiValueMap<>();
+        params.add(IdpConstants.GRANT_TYPE, GrantType.AUTHORIZATION_CODE.getType());
+        params.add(IdpConstants.CODE, code);
+        params.add(IdpConstants.REDIRECT_URI, redirectUri);
+        params.add(IdpConstants.CLIENT_ID, authCodeConfig.getClientId());
+        params.add(IdpConstants.CLIENT_SECRET, authCodeConfig.getClientSecret());
+
+        log.info(
+                "Requesting OIDC token, clientId={}, tokenEndpoint={}",
+                authCodeConfig.getClientId(),
+                authCodeConfig.getTokenEndpoint());
+        return executeRequest(
+                authCodeConfig.getTokenEndpoint(),
+                HttpMethod.POST,
+                null,
+                params,
+                IdpTokenResult.class);
+    }
+
+    private Map<String, Object> getUserInfo(IdpTokenResult tokenResult, OidcConfig oidcConfig) {
+        // Prefer ID Token
+        if (Strings.isNotBlank(tokenResult.getIdToken())) {
+            log.info("Extracting OIDC user info from ID token");
+            return parseUserInfo(tokenResult.getIdToken(), oidcConfig);
+        }
+
+        // Fallback: use UserInfo endpoint
+        log.warn("ID Token not available, falling back to UserInfo endpoint");
+        if (Strings.isBlank(tokenResult.getAccessToken())) {
+            throw new BusinessException(ErrorCode.INTERNAL_ERROR, "Failed to get OIDC user info");
+        }
+
+        AuthCodeConfig authCodeConfig = oidcConfig.getAuthCodeConfig();
+        if (Strings.isBlank(authCodeConfig.getUserInfoEndpoint())) {
+            throw new BusinessException(
+                    ErrorCode.INVALID_PARAMETER, "OIDC config missing user info endpoint");
+        }
+
+        return requestUserInfo(tokenResult.getAccessToken(), authCodeConfig, oidcConfig);
+    }
+
+    private Map<String, Object> parseUserInfo(String idToken, OidcConfig oidcConfig) {
+        String[] jwtParts = idToken.split("\\.", -1);
+        if (jwtParts.length < 2 || Strings.isBlank(jwtParts[1])) {
+            throw new BusinessException(ErrorCode.INVALID_REQUEST, "Invalid ID Token");
+        }
+        String payloadJson =
+                new String(Base64.getUrlDecoder().decode(jwtParts[1]), StandardCharsets.UTF_8);
+        Map<String, Object> userInfo = JsonUtil.parse(payloadJson, new TypeReference<>() {});
+
+        // Validate expiration
+        Object exp = userInfo.get("exp");
+        if (exp != null) {
+            Long expTime = null;
+            if (exp instanceof Number number) {
+                expTime = number.longValue();
+            } else {
+                try {
+                    expTime = Long.parseLong(exp.toString());
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            if (expTime == null) {
+                throw new BusinessException(ErrorCode.INVALID_REQUEST, "Invalid exp in ID Token");
+            }
+            long currentTime = System.currentTimeMillis() / 1000;
+            if (expTime <= currentTime) {
+                throw new BusinessException(ErrorCode.INVALID_REQUEST, "ID Token has expired");
+            }
+        }
+        // TODO: Verify the ID token signature with the provider JWK set.
+
+        log.info("Extracted OIDC user info from ID token, claimCount={}", userInfo.size());
+        return userInfo;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> requestUserInfo(
+            String accessToken, AuthCodeConfig authCodeConfig, OidcConfig oidcConfig) {
+        try {
+            HttpHeaders headers = new HttpHeaders();
+            headers.setBearerAuth(accessToken);
+
+            log.info(
+                    "Fetching OIDC user info, userInfoEndpoint={}",
+                    authCodeConfig.getUserInfoEndpoint());
+            Map<String, Object> userInfo =
+                    executeRequest(
+                            authCodeConfig.getUserInfoEndpoint(),
+                            HttpMethod.GET,
+                            headers,
+                            null,
+                            Map.class);
+
+            log.info("Fetched OIDC user info, claimCount={}", userInfo.size());
+            return userInfo;
+        } catch (Exception e) {
+            log.error(
+                    "Failed to fetch OIDC user info, userInfoEndpoint={}," + " errorMessage={}",
+                    authCodeConfig.getUserInfoEndpoint(),
+                    e.getMessage(),
+                    e);
+            throw new BusinessException(ErrorCode.INTERNAL_ERROR, "Failed to get user info");
+        }
+    }
+
+    private String createOrGetDeveloper(Map<String, Object> userInfo, OidcConfig config) {
+        IdentityMapping identityMapping = config.getIdentityMapping();
+        // userId & userName & email
+        String userIdField =
+                Strings.isBlank(identityMapping.getUserIdField())
+                        ? IdpConstants.SUBJECT
+                        : identityMapping.getUserIdField();
+        String userNameField =
+                Strings.isBlank(identityMapping.getUserNameField())
+                        ? IdpConstants.NAME
+                        : identityMapping.getUserNameField();
+        String emailField =
+                Strings.isBlank(identityMapping.getEmailField())
+                        ? IdpConstants.EMAIL
+                        : identityMapping.getEmailField();
+        String avatarUrlField =
+                Strings.isBlank(identityMapping.getAvatarUrlField())
+                        ? IdpConstants.AVATAR_URL
+                        : identityMapping.getAvatarUrlField();
+
+        Object userIdObj = userInfo.get(userIdField);
+        Object userNameObj = userInfo.get(userNameField);
+        Object emailObj = userInfo.get(emailField);
+        String avatarUrl = Objects.toString(userInfo.get(avatarUrlField), null);
+
+        String userId = Objects.toString(userIdObj, null);
+        String userName = Objects.toString(userNameObj, null);
+        String email = Objects.toString(emailObj, null);
+        if (Strings.isBlank(userId) || Strings.isBlank(userName)) {
+            throw new BusinessException(
+                    ErrorCode.INVALID_REQUEST, "Missing user ID or user name in ID Token");
+        }
+
+        // Reuse existing developer or create new
+        DeveloperResult existing =
+                developerService.getExternalDeveloper(config.getProvider(), userId);
+        if (existing != null) {
+            // Update avatar URL on each login
+            developerService.updateExternalDeveloperAvatar(config.getProvider(), userId, avatarUrl);
+            return existing.getDeveloperId();
+        }
+
+        CreateExternalDeveloperParam param =
+                CreateExternalDeveloperParam.builder()
+                        .provider(config.getProvider())
+                        .subject(userId)
+                        .displayName(userName)
+                        .email(email)
+                        .avatarUrl(avatarUrl)
+                        .authType(DeveloperAuthType.OIDC)
+                        .build();
+
+        return developerService.createExternalDeveloper(param).getDeveloperId();
+    }
+
+    private <T> T executeRequest(
+            String url,
+            HttpMethod method,
+            HttpHeaders headers,
+            Object body,
+            Class<T> responseType) {
+        HttpEntity<?> requestEntity = new HttpEntity<>(body, headers);
+        log.info("Executing OIDC HTTP request, url={}", url);
+        ResponseEntity<String> response =
+                restTemplate.exchange(url, method, requestEntity, String.class);
+
+        log.info(
+                "Received OIDC HTTP response, url={}, status={}, body={}",
+                url,
+                response.getStatusCode(),
+                response.getBody());
+
+        String responseBody = response.getBody();
+        if (responseBody == null) {
+            return null;
+        }
+
+        // OAuth2 token endpoint may return form-urlencoded instead of JSON (e.g., GitHub)
+        MediaType contentType = response.getHeaders().getContentType();
+        if (contentType != null
+                && contentType.isCompatibleWith(MediaType.APPLICATION_FORM_URLENCODED)) {
+            // Parse form-urlencoded  response
+            return JsonUtil.convert(decodeFormBody(responseBody), responseType);
+        }
+        return JsonUtil.parse(responseBody, responseType);
+    }
+
+    private Map<String, String> decodeFormBody(String responseBody) {
+        Map<String, String> result = new LinkedHashMap<>();
+        for (String pair : responseBody.split("&")) {
+            if (pair.isEmpty()) {
+                continue;
+            }
+            int separatorIndex = pair.indexOf('=');
+            String key = separatorIndex >= 0 ? pair.substring(0, separatorIndex) : pair;
+            String value = separatorIndex >= 0 ? pair.substring(separatorIndex + 1) : "";
+            result.put(decodeFormValue(key), decodeFormValue(value));
+        }
+        return result;
+    }
+
+    private String decodeFormValue(String value) {
+        return URLDecoder.decode(value, StandardCharsets.UTF_8);
+    }
+}

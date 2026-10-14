@@ -1,0 +1,63 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package com.alibaba.himarket.repository;
+
+import com.alibaba.himarket.entity.ConsumerCredential;
+import java.util.Optional;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+public interface ConsumerCredentialRepository extends BaseRepository<ConsumerCredential, Long> {
+
+    /**
+     * Find credential by consumer ID
+     *
+     * @param consumerId the consumer ID
+     * @return the consumer credential if found
+     */
+    Optional<ConsumerCredential> findByConsumerId(String consumerId);
+
+    /**
+     * Count credentials containing the specified API Key.
+     *
+     * @param apiKey the API Key to check
+     * @return the number of credentials containing the API Key
+     */
+    @Query(
+            value =
+                    """
+                    SELECT COUNT(1)
+                    FROM consumer_credential
+                    WHERE apikey_config IS NOT NULL
+                      AND JSON_CONTAINS(
+                            JSON_EXTRACT(apikey_config, '$.credentials[*].apiKey'),
+                            JSON_QUOTE(:apiKey)
+                          )
+                    """,
+            nativeQuery = true)
+    long countByApiKey(@Param("apiKey") String apiKey);
+
+    /**
+     * Delete all credentials by consumer ID
+     *
+     * @param consumerId the consumer ID
+     */
+    void deleteAllByConsumerId(String consumerId);
+}

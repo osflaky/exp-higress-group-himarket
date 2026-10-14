@@ -1,0 +1,326 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package com.alibaba.himarket.service.hichat.service;
+
+import com.alibaba.himarket.core.exception.ChatError;
+import com.alibaba.himarket.core.utils.CacheUtil;
+import com.alibaba.himarket.dto.result.chat.LlmInvokeResult;
+import com.alibaba.himarket.dto.result.common.DomainResult;
+import com.alibaba.himarket.dto.result.consumer.CredentialContext;
+import com.alibaba.himarket.dto.result.httpapi.HttpRouteResult;
+import com.alibaba.himarket.dto.result.model.ModelConfigResult;
+import com.alibaba.himarket.dto.result.product.ProductResult;
+import com.alibaba.himarket.service.GatewayService;
+import com.alibaba.himarket.service.hichat.manager.ChatBotManager;
+import com.alibaba.himarket.service.hichat.support.ChatBot;
+import com.alibaba.himarket.service.hichat.support.ChatContext;
+import com.alibaba.himarket.service.hichat.support.ChatEvent;
+import com.alibaba.himarket.service.hichat.support.ChatFormatter;
+import com.alibaba.himarket.service.hichat.support.InvokeModelParam;
+import com.alibaba.himarket.service.hichat.support.LlmChatRequest;
+import com.alibaba.himarket.support.common.Strings;
+import com.alibaba.himarket.support.product.ModelFeature;
+import com.github.benmanes.caffeine.cache.Cache;
+import io.agentscope.core.model.Model;
+import java.net.URI;
+import java.util.List;
+import java.util.function.BiFunction;
+import java.util.function.Consumer;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.util.CollectionUtils;
+import reactor.core.publisher.Flux;
+
+@Slf4j
+@RequiredArgsConstructor
+public abstract class AbstractLlmService implements LlmService {
+
+    protected final GatewayService gatewayService;
+
+    protected final ChatBotManager chatBotManager;
+
+    private final Cache<String, List<URI>> gatewayUriCache = CacheUtil.newCache(5 * 60);
+
+    @Override
+    public Flux<ChatEvent> invokeLlm(
+            InvokeModelParam param, Consumer<LlmInvokeResult> resultHandler) {
+
+        // Create context to collect answer and usage
+        ChatContext chatContext = new ChatContext(param.getChatId());
+
+        try {
+            LlmChatRequest request = composeRequest(param);
+
+            Model chatModel = newChatModel(request);
+            ChatBot chatBot = chatBotManager.getOrCreateChatBot(request, chatModel);
+
+            ChatFormatter formatter = new ChatFormatter();
+
+            // Start estimate time and collect answer
+            chatContext.start();
+            return Flux.concat(
+                            // Emit START event
+                            Flux.just(ChatEvent.start(param.getChatId())),
+
+                            // Stream chat events with error handling
+                            applyErrorHandling(
+                                    chatBot.chat(param)
+                                            .concatMap(
+                                                    event -> formatter.format(event, chatContext))
+                                            // Collect answer content
+                                            .doOnNext(chatContext::collect),
+                                    param.getChatId(),
+                                    chatContext))
+                    // Always emit DONE at the end
+                    .concatWith(
+                            Flux.defer(
+                                    () -> {
+                                        chatContext.stop();
+                                        return Flux.just(
+                                                ChatEvent.done(
+                                                        param.getChatId(), chatContext.getUsage()));
+                                    }))
+                    // Unified result handling for all completion scenarios
+                    .doFinally(signal -> resultHandler.accept(chatContext.toResult()));
+
+        } catch (Exception e) {
+            log.error(
+                    "Failed to process chat request, chatId={}, errorMessage={}",
+                    param.getChatId(),
+                    e.getMessage(),
+                    e);
+            ChatError chatError = ChatError.from(e);
+            chatContext.fail();
+            chatContext.appendAnswer(
+                    String.format("[Sorry, something went wrong: %s]", e.getMessage()));
+            resultHandler.accept(chatContext.toResult());
+
+            return Flux.just(
+                    ChatEvent.start(param.getChatId()),
+                    ChatEvent.error(
+                            param.getChatId(),
+                            chatError.name(),
+                            Strings.blankToDefault(e.getMessage(), chatError.getDescription())),
+                    ChatEvent.done(param.getChatId(), null));
+        }
+    }
+
+    private Flux<ChatEvent> applyErrorHandling(
+            Flux<ChatEvent> flux, String chatId, ChatContext chatContext) {
+        return flux.doOnCancel(
+                        () -> {
+                            log.warn("Chat stream was canceled by client, chatId={}", chatId);
+                            chatContext.fail();
+                        })
+                .doOnError(
+                        error -> {
+                            log.error(
+                                    "Chat stream encountered error, chatId={}, errorMessage={}",
+                                    chatId,
+                                    error.getMessage(),
+                                    error);
+                            chatContext.fail();
+                            chatContext.appendAnswer(
+                                    String.format(
+                                            "\n[Sorry, an error occurred: %s]",
+                                            error.getMessage()));
+                        })
+                .onErrorResume(
+                        error -> {
+                            ChatError chatError = ChatError.from(error);
+                            log.error(
+                                    "Chat execution failed, chatId={}, errorType={},"
+                                            + " errorMessage={}",
+                                    chatId,
+                                    chatError,
+                                    error.getMessage(),
+                                    error);
+
+                            return Flux.just(
+                                    ChatEvent.error(
+                                            chatId,
+                                            chatError.name(),
+                                            Strings.blankToDefault(
+                                                    error.getMessage(),
+                                                    chatError.getDescription())));
+                        });
+    }
+
+    protected LlmChatRequest composeRequest(InvokeModelParam param) {
+        ProductResult product = param.getProduct();
+
+        // Get gateway uris for model
+        List<URI> gatewayUris =
+                gatewayUriCache.get(param.getGatewayId(), gatewayService::fetchGatewayUris);
+        CredentialContext credentialContext = param.getCredentialContext();
+
+        return LlmChatRequest.builder()
+                .chatId(param.getChatId())
+                .sessionId(param.getSessionId())
+                .userId(param.getUserId())
+                .product(product)
+                .userMessages(param.getUserMessage())
+                .historyMessages(param.getHistoryMessages())
+                .rebuildMemory(param.isRebuildMemory())
+                .enableThinking(param.isEnableThinking())
+                .enableWebSearch(param.isEnableWebSearch())
+                .apiKey(credentialContext.getApiKey())
+                // Clone headers and query params
+                .headers(credentialContext.copyHeaders())
+                .queryParams(credentialContext.copyQueryParams())
+                .gatewayUris(gatewayUris)
+                .mcpConfigs(param.getMcpConfigs())
+                .build();
+    }
+
+    protected ModelFeature getOrDefaultModelFeature(ProductResult product) {
+        ModelFeature modelFeature = null;
+        if (product != null && product.getFeature() != null) {
+            modelFeature = product.getFeature().getModelFeature();
+        }
+        if (modelFeature == null) {
+            modelFeature = ModelFeature.builder().build();
+        }
+
+        return ModelFeature.builder()
+                .model(modelFeature.getModel())
+                .maxTokens(modelFeature.getMaxTokens())
+                .temperature(
+                        modelFeature.getTemperature() != null ? modelFeature.getTemperature() : 0.9)
+                .streaming(modelFeature.getStreaming() != null ? modelFeature.getStreaming() : true)
+                .webSearch(
+                        modelFeature.getWebSearch() != null ? modelFeature.getWebSearch() : false)
+                .enableThinking(modelFeature.getEnableThinking())
+                .enableMultiModal(modelFeature.getEnableMultiModal())
+                .build();
+    }
+
+    @Override
+    public boolean match(ModelConfigResult.ModelAPIConfig modelAPIConfig) {
+        if (modelAPIConfig == null
+                || !Strings.equalsIgnoreCase(getModelCategory(), modelAPIConfig.getModelCategory())
+                || CollectionUtils.isEmpty(modelAPIConfig.getAiProtocols())) {
+            return false;
+        }
+
+        return modelAPIConfig.getAiProtocols().stream()
+                .anyMatch(
+                        protocol ->
+                                getProtocols().stream()
+                                        .anyMatch(
+                                                supported ->
+                                                        Strings.equalsIgnoreCase(
+                                                                supported.getProtocol(),
+                                                                protocol)));
+    }
+
+    /**
+     * Build URI from model config with flexible path matching.
+     *
+     * @param modelConfig    model API configuration
+     * @param gatewayUris    fallback gateway URIs
+     * @param routeKeyword   keyword for route matching (e.g., "/multimodal-generation", "/chat/completions")
+     * @param pathProcessor  function to process the matched path (e.g., strip suffix, keep as-is)
+     * @return constructed URI, or null if failed
+     */
+    protected URI buildUri(
+            ModelConfigResult modelConfig,
+            List<URI> gatewayUris,
+            String routeKeyword,
+            BiFunction<String, String, String> pathProcessor) {
+
+        ModelConfigResult.ModelAPIConfig modelAPIConfig = modelConfig.getModelAPIConfig();
+        if (modelAPIConfig == null || CollectionUtils.isEmpty(modelAPIConfig.getRoutes())) {
+            log.error("Failed to build URI: model API config is null or contains no routes");
+            return null;
+        }
+
+        // Find matching route by keyword
+        HttpRouteResult route =
+                modelAPIConfig.getRoutes().stream()
+                        .filter(routeCandidate -> routeMatches(routeCandidate, routeKeyword))
+                        .findFirst()
+                        .orElseGet(() -> modelAPIConfig.getRoutes().get(0));
+
+        // Get and process path
+        String path = routeKeyword;
+        if (route.getMatch() != null && route.getMatch().getPath() != null) {
+            HttpRouteResult.RouteMatchPath routeMatchPath = route.getMatch().getPath();
+            path = pathProcessor.apply(routeMatchPath.getValue(), routeMatchPath.getType());
+        }
+
+        org.springframework.web.util.UriComponentsBuilder builder =
+                org.springframework.web.util.UriComponentsBuilder.newInstance();
+
+        // Try to get public domain first, fallback to first domain
+        DomainResult domain = null;
+        if (!CollectionUtils.isEmpty(route.getDomains())) {
+            domain =
+                    route.getDomains().stream()
+                            .filter(d -> !Strings.equalsIgnoreCase(d.getNetworkType(), "intranet"))
+                            .findFirst()
+                            .orElse(route.getDomains().get(0));
+        }
+
+        if (domain != null) {
+            String protocol =
+                    Strings.isNotBlank(domain.getProtocol())
+                            ? domain.getProtocol().toLowerCase()
+                            : "http";
+            builder.scheme(protocol).host(domain.getDomain());
+            if (domain.getPort() != null && domain.getPort() > 0) {
+                builder.port(domain.getPort());
+            }
+        } else if (!CollectionUtils.isEmpty(gatewayUris)) {
+            URI uri = gatewayUris.get(0);
+            builder.scheme(uri.getScheme() != null ? uri.getScheme() : "http").host(uri.getHost());
+            if (uri.getPort() != -1) {
+                builder.port(uri.getPort());
+            }
+        } else {
+            log.error("Failed to build URI: no valid domain found and no gateway URIs provided");
+            return null;
+        }
+
+        builder.path(path);
+        URI uri = builder.build().toUri();
+        log.debug("Built model invocation URI, uri={}", uri);
+        return uri;
+    }
+
+    private boolean routeMatches(HttpRouteResult route, String routeKeyword) {
+        if (route.getMatch() == null || route.getMatch().getPath() == null) {
+            return false;
+        }
+
+        String path = route.getMatch().getPath().getValue();
+        return path != null && path.contains(routeKeyword);
+    }
+
+    /**
+     * Create a protocol-specific chat model instance
+     *
+     * @param request request containing model config, credentials, and parameters
+     * @return model instance (e.g. DashScopeChatModel, OpenAIChatModel)
+     */
+    Model newChatModel(LlmChatRequest request) {
+        throw new UnsupportedOperationException(
+                getClass().getSimpleName() + " does not use an AgentScope chat model");
+    }
+}

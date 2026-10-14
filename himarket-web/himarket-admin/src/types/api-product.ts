@@ -1,0 +1,420 @@
+import type { ProductCategory } from './product-category';
+
+export interface ApiProductConfig {
+  spec: string;
+  meta: {
+    source: string;
+    type: string;
+  };
+}
+
+export interface SkillResource {
+  content?: string;
+  metadata?: Record<string, unknown>;
+  name?: string;
+  resourceIdentifier?: string;
+  type?: string;
+}
+
+export interface SkillCard {
+  description?: string;
+  name?: string;
+  resource?: Record<string, SkillResource>;
+  skillMd?: string;
+  [key: string]: unknown;
+}
+
+export interface SkillDraft {
+  skillCard?: SkillCard;
+  version?: string;
+}
+
+export interface AgentSpecResource {
+  content?: string;
+  metadata?: Record<string, unknown>;
+  name?: string;
+  resourceIdentifier?: string;
+  type?: string;
+}
+
+export interface AgentSpecCard {
+  bizTags?: string;
+  content?: string;
+  description?: string;
+  name?: string;
+  namespaceId?: string;
+  resource?: Record<string, AgentSpecResource>;
+  [key: string]: unknown;
+}
+
+export interface WorkerDraft {
+  agentSpecCard?: AgentSpecCard;
+  version?: string;
+}
+
+// 产品图标类型
+export interface ProductIcon {
+  type: 'URL' | 'BASE64';
+  value: string;
+}
+
+export interface ApiProductMcpConfig {
+  mcpServerName: string;
+  tools: string;
+  /** 协议类型，优先使用此字段（meta.protocol 已废弃） */
+  protocol?: string;
+  /** 来源类型，优先使用此字段（meta.fromType 已废弃） */
+  fromType?: string;
+  meta: {
+    source: string;
+    mcpServerName: string;
+    mcpServerConfig: Record<string, unknown>;
+    fromType: string;
+    protocol?: string;
+  };
+  mcpServerConfig: {
+    path: string;
+    domains: {
+      domain: string;
+      port?: number;
+      protocol: string;
+    }[];
+    rawConfig?: unknown;
+  };
+}
+
+export interface ApiProductAgentConfig {
+  agentAPIConfig: {
+    agentProtocols: string[]; // 协议列表，包含 "a2a" 时使用 agentCard
+    routes?: Array<{
+      // HTTP 路由（非 A2A 协议使用）
+      domains: Array<{
+        domain: string;
+        port?: number;
+        protocol: string;
+      }>;
+      description: string;
+      match: {
+        methods: string[] | null;
+        path: {
+          value: string;
+          type: string;
+        };
+        headers?: Array<{
+          name: string;
+          type: string;
+          value: string;
+        }> | null;
+        queryParams?: Array<{
+          name: string;
+          type: string;
+          value: string;
+        }> | null;
+      };
+    }>;
+    agentCard?: {
+      // Agent Card 信息（A2A 协议）
+      name: string;
+      version: string;
+      description?: string;
+      url?: string;
+      preferredTransport?: string;
+      protocolVersion?: string; // 协议版本
+      skills?: Array<{
+        id: string;
+        name: string;
+        description?: string;
+        tags?: string[];
+      }>;
+      capabilities?: {
+        streaming?: boolean;
+        [key: string]: unknown;
+      };
+      additionalInterfaces?: Array<{
+        // 附加接口信息（注意：复数形式）
+        transport: string; // 传输协议（HTTP/gRPC/JSONRPC）
+        url: string;
+        [key: string]: unknown;
+      }>;
+      [key: string]: unknown; // 支持其他扩展字段
+    };
+  };
+  meta?: {
+    // 元数据信息
+    source?: string; // 来源：NACOS / APIG_AI / HIGRESS 等
+  };
+}
+
+export interface ApiProductModelConfig {
+  modelAPIConfig: {
+    modelCategory?: string;
+    aiProtocols: string[];
+    routes: Array<{
+      domains: Array<{
+        domain: string;
+        port?: number;
+        protocol: string;
+      }>;
+      description: string;
+      builtin?: boolean;
+      match: {
+        methods: string[] | null;
+        path: {
+          value: string;
+          type: string;
+        };
+        headers?: Array<{
+          name: string;
+          type: string;
+          value: string;
+        }> | null;
+        queryParams?: Array<{
+          name: string;
+          type: string;
+          value: string;
+        }> | null;
+      };
+    }>;
+  };
+}
+
+// API 配置相关类型
+export interface RestAPIItem {
+  apiId: string;
+  apiName: string;
+}
+
+export interface HigressMCPItem {
+  mcpServerName?: string; // MCP Server 名称（用于 MCP Server 产品）
+  modelRouteName?: string; // Model API 路由名称（用于 Model API 产品）
+  fromGatewayType: 'HIGRESS';
+}
+
+export interface NacosMCPItem {
+  mcpServerName: string;
+  fromGatewayType: 'NACOS';
+  namespaceId: string;
+}
+
+export interface APIGAIMCPItem {
+  mcpServerName: string;
+  fromGatewayType: 'APIG_AI' | 'ADP_AI_GATEWAY' | 'APSARA_GATEWAY';
+  mcpRouteId: string;
+  mcpServerId?: string;
+  apiId?: string;
+  type?: string;
+}
+
+export interface AIGatewayAgentItem {
+  agentApiId: string;
+  agentApiName: string;
+  fromGatewayType: 'APIG_AI'; // Agent API 只支持 APIG_AI 网关
+}
+
+export interface AIGatewayModelItem {
+  modelApiId: string;
+  modelApiName: string;
+  fromGatewayType: 'APIG_AI'; // Model API 只支持 APIG_AI 网关
+}
+
+// ADP AI Gateway Model API 类型
+export interface AdpAIGatewayModelItem {
+  modelApiId: string;
+  modelApiName: string;
+  fromGatewayType: 'ADP_AI_GATEWAY';
+}
+
+// Apsara Gateway Model API 类型
+export interface ApsaraGatewayModelItem {
+  modelApiId: string;
+  modelApiName: string;
+  fromGatewayType: 'APSARA_GATEWAY';
+}
+
+// Nacos Agent 列表项
+export interface NacosAgentItem {
+  agentName: string; // Agent 名称（唯一标识）
+  description?: string; // Agent 描述
+  fromGatewayType: 'NACOS'; // 标识来源
+  type: string; // 显示类型，如 "Agent API (public)"
+}
+
+export type ApiItem =
+  | RestAPIItem
+  | HigressMCPItem
+  | APIGAIMCPItem
+  | NacosMCPItem
+  | AIGatewayAgentItem
+  | AIGatewayModelItem
+  | NacosAgentItem;
+
+// API Definition 类型
+export interface ApiDefinition {
+  apiDefinitionId: string;
+  name: string;
+  description?: string;
+  type: 'MCP_SERVER' | 'REST_API' | 'AGENT_API' | 'MODEL_API';
+  status: string;
+  version?: string;
+  spec?: Record<string, unknown>;
+  meta?: Record<string, unknown>;
+  policies?: unknown[];
+  createAt?: string;
+  updatedAt?: string;
+}
+
+export interface CreateApiDefinitionRequest {
+  name: string;
+  description?: string;
+  type: 'MCP_SERVER';
+  relatedProductId?: string;
+  version?: string;
+  spec: Record<string, unknown>;
+  meta?: Record<string, unknown>;
+  policies?: unknown[];
+}
+
+// 关联服务配置
+export interface LinkedService {
+  productId: string;
+  gatewayId?: string;
+  nacosId?: string;
+  apiDefinitionId?: string;
+  sourceType: 'GATEWAY' | 'NACOS' | 'CUSTOM' | 'API_DEFINITION';
+  apigRefConfig?: RestAPIItem | APIGAIMCPItem | AIGatewayAgentItem | AIGatewayModelItem;
+  higressRefConfig?: HigressMCPItem;
+  nacosRefConfig?: NacosMCPItem | NacosAgentItem; // 扩展支持 Agent
+  adpAIGatewayRefConfig?: APIGAIMCPItem | AdpAIGatewayModelItem;
+  apsaraGatewayRefConfig?: APIGAIMCPItem | ApsaraGatewayModelItem;
+}
+
+// Product Feature Types
+export interface ModelFeature {
+  model?: string;
+  maxTokens?: number;
+  temperature?: number;
+  streaming?: boolean;
+  webSearch?: boolean;
+  enableThinking?: boolean;
+  enableMultiModal?: boolean;
+}
+
+export interface ProductFeature {
+  modelFeature?: ModelFeature;
+  skillConfig?: ApiProductSkillConfig;
+  workerConfig?: ApiProductWorkerConfig;
+}
+
+export interface ApiProductSkillConfig {
+  skillTags?: string[];
+  downloadCount?: number;
+  versionInfos?: Record<string, ApiProductVersionInfo>;
+  latestVersion?: string;
+  registryType?: 'NACOS' | 'AIREGISTRY';
+  nacosId?: string;
+  airegistryId?: string;
+  namespace?: string;
+  skillName?: string;
+}
+
+export interface ApiProductVersionInfo {
+  author?: string;
+}
+
+export interface ApiProductWorkerConfig {
+  nacosId?: string;
+  namespace?: string;
+  workerName?: string;
+  currentVersion?: string;
+  latestVersion?: string;
+  tags?: string[];
+  downloadCount?: number;
+  versionInfos?: Record<string, ApiProductVersionInfo>;
+}
+
+export interface ApiProduct {
+  productId: string;
+  name: string;
+  description: string;
+  type: 'REST_API' | 'MCP_SERVER' | 'AGENT_API' | 'MODEL_API' | 'AGENT_SKILL' | 'WORKER';
+  status: 'PENDING' | 'READY' | 'PUBLISHED' | string;
+  createAt: string;
+  enableConsumerAuth?: boolean;
+  autoApprove?: boolean;
+  apiConfig?: ApiProductConfig;
+  mcpConfig?: ApiProductMcpConfig;
+  agentConfig?: ApiProductAgentConfig;
+  modelConfig?: ApiProductModelConfig;
+  document?: string;
+  icon?: ProductIcon;
+  categories?: ProductCategory[];
+  feature?: ProductFeature;
+  skillConfig?: ApiProductSkillConfig;
+  workerConfig?: ApiProductWorkerConfig;
+}
+
+export interface McpMetaItem {
+  connectionConfig?: string;
+  createAt?: string;
+  createdBy?: string;
+  description?: string;
+  displayName?: string;
+  endpointHostingType?: string;
+  endpointProtocol?: string;
+  endpointStatus?: string;
+  endpointUrl?: string;
+  extraParams?: string | unknown[];
+  mcpName?: string;
+  mcpServerId?: string;
+  origin?: string;
+  protocolType?: string;
+  repoUrl?: string;
+  sandboxRequired?: boolean;
+  subscribeParams?: string | Record<string, unknown>;
+  tags?: string;
+  toolsConfig?: string | unknown[];
+}
+
+export interface ApiListItem extends Record<string, unknown> {
+  agentApiId?: string;
+  agentApiName?: string;
+  agentName?: string;
+  apiId?: string;
+  apiName?: string;
+  description?: string;
+  fromGatewayType?: string;
+  modelApiId?: string;
+  modelApiName?: string;
+  modelRouteName?: string;
+  mcpRouteId?: string;
+  mcpServerId?: string;
+  mcpServerName?: string;
+  type?: string;
+}
+
+export interface DeploySandboxItem {
+  sandboxId: string;
+  sandboxName?: string;
+}
+
+export interface ExtraParamDef {
+  default?: unknown;
+  description?: string;
+  example?: unknown;
+  name: string;
+  position?: string;
+  required?: boolean;
+}
+
+// Publication 类型定义（Product 和 Portal 的发布关系）
+export interface Publication {
+  publicationId: string; // 发布ID
+  portalId: string; // 门户ID
+  portalName: string; // 门户名称
+  productId: string; // 产品ID
+  productName: string; // 产品名称
+  productType: string; // 产品类型
+  description: string; // 产品描述
+  autoApproveSubscriptions: boolean; // 是否自动审批订阅
+  createAt: string; // 创建时间
+}

@@ -1,0 +1,110 @@
+hub: opensource-registry.cn-hangzhou.cr.aliyuncs.com/higress-group
+
+# 全局资源规格：small(1c2g) / standard(2c4g) / large(4c8g)
+# 各组件可通过 frontend.size / admin.size / server.size 单独覆盖
+size: standard
+
+frontend:
+  image:
+    repository: himarket-frontend
+    tag: "latest"
+    pullPolicy: Always
+  service:
+    type: LoadBalancer
+    port: 80
+  # replicaCount: 不设置时由 size 自动决定（large=2, 其他=1）；显式设置可覆盖
+  serverPort: 8000
+  # size: small  # 可选：覆盖全局规格
+
+admin:
+  image:
+    repository: himarket-admin
+    tag: "latest"
+    pullPolicy: Always
+  service:
+    type: LoadBalancer
+    port: 80
+  # replicaCount: 不设置时由 size 自动决定（large=2, 其他=1）；显式设置可覆盖
+  serverPort: 8000
+  # size: small  # 可选：覆盖全局规格
+
+server:
+  image:
+    repository: himarket-server
+    tag: "latest"
+    pullPolicy: Always
+  service:
+    type: ClusterIP
+    port: 80
+  # replicaCount: 不设置时由 size 自动决定（large=2, 其他=1）；显式设置可覆盖
+  serverPort: 8080
+  # size: large  # 可选：覆盖全局规格
+  # JVM 调优参数（module opens 已固定在镜像 ENTRYPOINT 中，此处仅控制调优参数）
+  javaOpts: "-XX:+UseG1GC -XX:MaxRAMPercentage=75.0 -XX:InitialRAMPercentage=50.0 -XX:MaxMetaspaceSize=512m -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp/heapdump.hprof"
+  # JWT Secret（留空则自动生成随机值）
+  jwtSecret: ""
+
+# MySQL 数据库配置（始终部署内置 MySQL）
+mysql:
+  image:
+    repository: mysql
+    tag: "latest"
+    pullPolicy: Always
+  
+  # 数据库配置
+  auth:
+    database: "himarket_db"
+    username: "himarket_user"
+    # 可选：设置固定密码（留空则自动生成随机密码）
+    rootPassword: ""  # 设置root密码，如 "myRootPass123"
+    password: ""      # 设置应用用户密码，如 "myAppPass123"
+  
+  # Service 配置
+  service:
+    external:
+      enabled: false  # 建议生产环境设为 false
+      type: LoadBalancer
+  
+  # 存储配置
+  persistence:
+    storageClass: "alicloud-disk-essd"  # 根据实际环境调整
+    size: 50Gi
+    accessMode: ReadWriteOnce
+  
+  # 资源配置
+  resources:
+    requests:
+      cpu: "1"
+      memory: "1Gi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+  
+  # StatefulSet 副本数
+  replicaCount: 1
+
+serviceAccount:
+  name: "himarket"
+
+# 共享沙箱配置
+sandbox:
+  enabled: true
+  terminalEnabled: false
+  image:
+    repository: sandbox
+    tag: "latest"
+    pullPolicy: Always
+  resources:
+    requests:
+      cpu: "1"
+      memory: "1Gi"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+  allowedCommands: "qodercli,qwen,claude-agent-acp,opencode"
+  # 工作空间持久化配置
+  persistence:
+    enabled: true
+    storageClass: "alicloud-disk-essd"  # 根据实际环境调整
+    size: 50Gi
+    accessMode: ReadWriteOnce

@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!-- Console appender: enabled for all environments -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %magenta([%thread]) %highlight(%-5level) %cyan(%logger{50}) - %msg%n
+            </pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- File appender: enabled only in prod profile -->
+    <springProfile name="prod">
+        <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+            <file>/app/logs/himarket-server.log</file>
+
+            <encoder>
+                <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{50} - %msg%n</pattern>
+                <charset>UTF-8</charset>
+            </encoder>
+
+            <!-- Rolling policy: by date and size -->
+            <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+                <fileNamePattern>/app/logs/archived/himarket-server-%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+                <maxFileSize>100MB</maxFileSize>      <!-- Max size per file -->
+                <maxHistory>30</maxHistory>           <!-- Keep 30 days -->
+                <totalSizeCap>3GB</totalSizeCap>      <!-- Max total size of archived logs -->
+            </rollingPolicy>
+        </appender>
+    </springProfile>
+
+    <!-- Default: console + file (local environment) -->
+    <springProfile name="!prod">
+        <appender name="LOCAL_FILE" class="ch.qos.logback.core.FileAppender">
+            <file>${user.home}/himarket.log</file>
+            <encoder>
+                <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{50} - %msg%n</pattern>
+                <charset>UTF-8</charset>
+            </encoder>
+        </appender>
+        <root level="INFO">
+            <appender-ref ref="CONSOLE"/>
+            <appender-ref ref="LOCAL_FILE"/>
+        </root>
+    </springProfile>
+
+    <!-- Prod profile: console + file -->
+    <springProfile name="prod">
+        <root level="INFO">
+            <appender-ref ref="CONSOLE"/>
+            <appender-ref ref="FILE"/>
+        </root>
+    </springProfile>
+
+    <!-- Application log levels -->
+    <logger name="com.alibaba.himarket" level="INFO"/>
+
+    <!-- Framework log levels -->
+    <logger name="org.springframework" level="INFO"/>
+    <logger name="org.hibernate" level="INFO"/>
+    <logger name="org.hibernate.SQL" level="INFO"/>
+    <logger name="org.hibernate.type.descriptor.sql.BasicBinder" level="INFO"/>
+
+    <!-- Suppress repetitive K8s config file warning -->
+    <logger name="io.fabric8.kubernetes.client.Config" level="ERROR"/>
+
+</configuration>

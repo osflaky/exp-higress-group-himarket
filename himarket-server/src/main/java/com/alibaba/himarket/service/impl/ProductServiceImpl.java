@@ -1,0 +1,1228 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package com.alibaba.himarket.service.impl;
+
+import com.alibaba.himarket.core.constant.Resources;
+import com.alibaba.himarket.core.event.PortalDeletingEvent;
+import com.alibaba.himarket.core.event.ProductConfigReloadEvent;
+import com.alibaba.himarket.core.event.ProductDeletingEvent;
+import com.alibaba.himarket.core.exception.BusinessException;
+import com.alibaba.himarket.core.exception.ErrorCode;
+import com.alibaba.himarket.core.security.ContextHolder;
+import com.alibaba.himarket.core.utils.CacheUtil;
+import com.alibaba.himarket.core.utils.IdGenerator;
+import com.alibaba.himarket.dto.params.product.AddProductRefParam;
+import com.alibaba.himarket.dto.params.product.CreateProductParam;
+import com.alibaba.himarket.dto.params.product.ProductSortBy;
+import com.alibaba.himarket.dto.params.product.QueryProductParam;
+import com.alibaba.himarket.dto.params.product.QueryProductSubscriptionParam;
+import com.alibaba.himarket.dto.params.product.UpdateProductParam;
+import com.alibaba.himarket.dto.params.product.UpdateProductSourceParam;
+import com.alibaba.himarket.dto.result.ProductCategoryResult;
+import com.alibaba.himarket.dto.result.agent.AgentConfigResult;
+import com.alibaba.himarket.dto.result.common.PageResult;
+import com.alibaba.himarket.dto.result.common.VersionResult;
+import com.alibaba.himarket.dto.result.consumer.CredentialContext;
+import com.alibaba.himarket.dto.result.gateway.GatewayResult;
+import com.alibaba.himarket.dto.result.httpapi.APIConfigResult;
+import com.alibaba.himarket.dto.result.mcp.McpConfigResult;
+import com.alibaba.himarket.dto.result.mcp.McpToolListResult;
+import com.alibaba.himarket.dto.result.model.ModelConfigResult;
+import com.alibaba.himarket.dto.result.nacos.NacosResult;
+import com.alibaba.himarket.dto.result.portal.PortalResult;
+import com.alibaba.himarket.dto.result.product.ProductPublicationResult;
+import com.alibaba.himarket.dto.result.product.ProductRefResult;
+import com.alibaba.himarket.dto.result.product.ProductResult;
+import com.alibaba.himarket.dto.result.product.SubscriptionResult;
+import com.alibaba.himarket.entity.Consumer;
+import com.alibaba.himarket.entity.Product;
+import com.alibaba.himarket.entity.ProductCategoryRelation;
+import com.alibaba.himarket.entity.ProductPublication;
+import com.alibaba.himarket.entity.ProductRef;
+import com.alibaba.himarket.entity.ProductSubscription;
+import com.alibaba.himarket.repository.ApiDefinitionRepository;
+import com.alibaba.himarket.repository.ConsumerRepository;
+import com.alibaba.himarket.repository.ProductPublicationRepository;
+import com.alibaba.himarket.repository.ProductRefRepository;
+import com.alibaba.himarket.repository.ProductRepository;
+import com.alibaba.himarket.repository.SubscriptionRepository;
+import com.alibaba.himarket.service.AiRegistryService;
+import com.alibaba.himarket.service.GatewayService;
+import com.alibaba.himarket.service.McpToolService;
+import com.alibaba.himarket.service.NacosService;
+import com.alibaba.himarket.service.PortalService;
+import com.alibaba.himarket.service.ProductCategoryService;
+import com.alibaba.himarket.service.ProductService;
+import com.alibaba.himarket.service.SkillService;
+import com.alibaba.himarket.service.WorkerService;
+import com.alibaba.himarket.support.common.Strings;
+import com.alibaba.himarket.support.enums.ProductStatus;
+import com.alibaba.himarket.support.enums.ProductType;
+import com.alibaba.himarket.support.enums.SkillRegistryType;
+import com.alibaba.himarket.support.enums.SourceType;
+import com.alibaba.himarket.support.product.NacosRefConfig;
+import com.alibaba.himarket.support.product.ProductFeature;
+import com.alibaba.himarket.support.product.SkillConfig;
+import com.alibaba.himarket.support.product.WorkerConfig;
+import com.alibaba.himarket.utils.JsonUtil;
+import com.github.benmanes.caffeine.cache.Cache;
+import jakarta.persistence.criteria.CriteriaBuilder;
+import jakarta.persistence.criteria.CriteriaQuery;
+import jakarta.persistence.criteria.Expression;
+import jakarta.persistence.criteria.Predicate;
+import jakarta.persistence.criteria.Root;
+import jakarta.persistence.criteria.Subquery;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.context.event.EventListener;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.domain.Specification;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.CollectionUtils;
+
+@Service
+@Slf4j
+@RequiredArgsConstructor
+@Transactional
+public class ProductServiceImpl implements ProductService {
+
+    private final ContextHolder contextHolder;
+
+    private final PortalService portalService;
+
+    private final GatewayService gatewayService;
+
+    private final ProductRepository productRepository;
+
+    private final ProductRefRepository productRefRepository;
+
+    private final ApiDefinitionRepository apiDefinitionRepository;
+
+    private final ProductPublicationRepository publicationRepository;
+
+    private final SubscriptionRepository subscriptionRepository;
+
+    private final ConsumerRepository consumerRepository;
+
+    private final NacosService nacosService;
+
+    private final ProductCategoryService productCategoryService;
+
+    private final McpToolService mcpToolService;
+
+    private final WorkerService workerService;
+
+    private final SkillService skillService;
+
+    private final AiRegistryService aiRegistryService;
+
+    private final ApplicationEventPublisher eventPublisher;
+
+    /**
+     * Cache to prevent duplicate sync within interval (5 minutes default)
+     */
+    private final Cache<String, Boolean> productSyncCache = CacheUtil.newCache(5);
+
+    @Override
+    public ProductResult createProduct(CreateProductParam param) {
+        productRepository
+                .findByNameAndAdminId(param.getName(), contextHolder.getUser())
+                .ifPresent(
+                        product -> {
+                            throw new BusinessException(
+                                    ErrorCode.CONFLICT,
+                                    String.format(
+                                            "Product with name '%s' already exists",
+                                            product.getName()));
+                        });
+
+        String productId = IdGenerator.genApiProductId();
+
+        Product product = param.convertTo();
+        product.setProductId(productId);
+        product.setAdminId(contextHolder.getUser());
+
+        // Set feature for AGENT_SKILL / WORKER products
+        initDefaultFeature(product);
+
+        productRepository.save(product);
+
+        // Set product categories
+        setProductCategories(productId, param.getCategories());
+
+        return getProduct(productId);
+    }
+
+    private void initDefaultFeature(Product product) {
+        ProductType productType = product.getType();
+        if (productType != ProductType.AGENT_SKILL && productType != ProductType.WORKER) {
+            return;
+        }
+
+        ProductFeature feature = product.getFeature();
+        if (feature == null) {
+            feature = ProductFeature.builder().build();
+        }
+        if (productType == ProductType.AGENT_SKILL && feature.getSkillConfig() != null) {
+            product.setFeature(feature);
+            return;
+        }
+        if (productType == ProductType.WORKER && feature.getWorkerConfig() != null) {
+            product.setFeature(feature);
+            return;
+        }
+
+        NacosResult nacos = nacosService.getDefaultNacosInstance();
+        if (nacos == null) {
+            return;
+        }
+
+        if (productType == ProductType.AGENT_SKILL) {
+            feature.setSkillConfig(
+                    SkillConfig.builder()
+                            .registryType(SkillRegistryType.NACOS)
+                            .nacosId(nacos.getNacosId())
+                            .namespace(nacos.getDefaultNamespace())
+                            .build());
+        } else {
+            feature.setWorkerConfig(
+                    WorkerConfig.builder()
+                            .nacosId(nacos.getNacosId())
+                            .namespace(nacos.getDefaultNamespace())
+                            .build());
+        }
+
+        product.setFeature(feature);
+    }
+
+    @Override
+    public ProductResult getProduct(String productId) {
+        Product product =
+                contextHolder.isAdministrator()
+                        ? findProduct(productId)
+                        : findPublishedProduct(contextHolder.getPortal(), productId);
+
+        // Trigger async sync if not synced recently (cache miss)
+        if (productSyncCache.getIfPresent(productId) == null) {
+            productRefRepository
+                    .findByProductId(productId)
+                    .ifPresent(
+                            o -> {
+                                productSyncCache.put(productId, Boolean.TRUE);
+                                eventPublisher.publishEvent(
+                                        new ProductConfigReloadEvent(productId));
+                            });
+        }
+
+        ProductResult result = new ProductResult().convertFrom(product);
+
+        // Fill product information
+        fillProducts(Collections.singletonList(result));
+        return result;
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public PageResult<ProductResult> listProducts(QueryProductParam param, Pageable pageable) {
+        if (!contextHolder.isAdministrator()) {
+            param.setPortalId(contextHolder.getPortal());
+        }
+
+        // Non-admin users can only see published products
+        if (!contextHolder.isAdministrator()) {
+            param.setStatus(ProductStatus.PUBLISHED);
+        }
+
+        if (param.getType() != null && param.hasFilter()) {
+            return listProductsWithFilter(param, pageable);
+        }
+
+        // Skill/Worker: sort by updated time (default) or download count
+        if (param.getType() == ProductType.AGENT_SKILL || param.getType() == ProductType.WORKER) {
+            if (param.getSortBy() == ProductSortBy.DOWNLOAD_COUNT) {
+                return listProductsSortedByDownloadCount(param, pageable);
+            }
+            // UPDATED_AT (default): use DB-level sort
+            Pageable sortedPageable =
+                    org.springframework.data.domain.PageRequest.of(
+                            pageable.getPageNumber(),
+                            pageable.getPageSize(),
+                            org.springframework.data.domain.Sort.by(
+                                    org.springframework.data.domain.Sort.Direction.DESC,
+                                    "updatedAt"));
+            Page<Product> page =
+                    productRepository.findAll(buildSpecification(param), sortedPageable);
+            List<ProductResult> results =
+                    page.stream().map(product -> new ProductResult().convertFrom(product)).toList();
+            fillProducts(results);
+            return PageResult.of(
+                    results, page.getNumber() + 1, page.getSize(), page.getTotalElements());
+        }
+
+        Page<Product> page = productRepository.findAll(buildSpecification(param), pageable);
+        List<ProductResult> results =
+                page.stream().map(product -> new ProductResult().convertFrom(product)).toList();
+
+        // Fill product information
+        fillProducts(results);
+
+        return PageResult.of(
+                results, page.getNumber() + 1, page.getSize(), page.getTotalElements());
+    }
+
+    @Override
+    public ProductResult updateProduct(String productId, UpdateProductParam param) {
+        Product product = findProduct(productId);
+        // Change API product type
+        if (param.getType() != null && product.getType() != param.getType()) {
+            productRefRepository
+                    .findFirstByProductId(productId)
+                    .ifPresent(
+                            productRef -> {
+                                throw new BusinessException(
+                                        ErrorCode.INVALID_REQUEST,
+                                        "API product already linked to API");
+                            });
+            // Clear product features
+            product.setFeature(null);
+            param.setFeature(null);
+        }
+        param.update(product);
+
+        productRepository.saveAndFlush(product);
+
+        // Set product categories
+        setProductCategories(product.getProductId(), param.getCategories());
+
+        return getProduct(product.getProductId());
+    }
+
+    @Override
+    public void publishProduct(String productId, String portalId) {
+        portalService.existsPortal(portalId);
+        if (publicationRepository.findByPortalIdAndProductId(portalId, productId).isPresent()) {
+            // Already published to this portal, ensure product status is correct
+            Product product = findProduct(productId);
+            if (product.getStatus() != ProductStatus.PUBLISHED) {
+                product.setStatus(ProductStatus.PUBLISHED);
+                productRepository.save(product);
+            }
+            return;
+        }
+
+        Product product = findProduct(productId);
+
+        // Validate online version for AGENT_SKILL and WORKER types.
+        validateOnlineVersion(product);
+
+        product.setStatus(ProductStatus.PUBLISHED);
+
+        ProductPublication productPublication = new ProductPublication();
+        productPublication.setPublicationId(IdGenerator.genPublicationId());
+        productPublication.setPortalId(portalId);
+        productPublication.setProductId(productId);
+
+        publicationRepository.save(productPublication);
+        productRepository.save(product);
+    }
+
+    @Override
+    public PageResult<ProductPublicationResult> getPublications(
+            String productId, Pageable pageable) {
+        Page<ProductPublication> publications =
+                publicationRepository.findByProductId(productId, pageable);
+
+        return new PageResult<ProductPublicationResult>()
+                .convertFrom(
+                        publications,
+                        publication -> {
+                            ProductPublicationResult publicationResult =
+                                    new ProductPublicationResult().convertFrom(publication);
+                            PortalResult portal;
+                            try {
+                                portal = portalService.getPortal(publication.getPortalId());
+                            } catch (Exception e) {
+                                log.error(
+                                        "Failed to get portal, portalId={}",
+                                        publication.getPortalId(),
+                                        e);
+                                return null;
+                            }
+
+                            publicationResult.setPortalName(portal.getName());
+                            publicationResult.setAutoApproveSubscriptions(
+                                    portal.getPortalSettingConfig().getAutoApproveSubscriptions());
+
+                            return publicationResult;
+                        });
+    }
+
+    @Override
+    public void unpublishProduct(String productId, String publicationId) {
+        Product product = findProduct(productId);
+
+        // Find publication by publicationId
+        ProductPublication publication =
+                publicationRepository
+                        .findByPublicationId(publicationId)
+                        .orElseThrow(
+                                () ->
+                                        new BusinessException(
+                                                ErrorCode.NOT_FOUND,
+                                                Resources.PUBLICATION,
+                                                publicationId));
+
+        // Verify: ensure publication belongs to this product
+        if (!publication.getProductId().equals(productId)) {
+            throw new BusinessException(
+                    ErrorCode.INVALID_REQUEST, "Publication does not belong to this product");
+        }
+
+        String portalId = publication.getPortalId();
+        portalService.existsPortal(portalId);
+
+        /*
+         * Update product status:
+         * If the product is published in other portals -> set to PUBLISHED
+         * If not published anywhere else -> set to READY
+         */
+        ProductStatus toStatus =
+                publicationRepository.existsByProductIdAndPortalIdNot(productId, portalId)
+                        ? ProductStatus.PUBLISHED
+                        : ProductStatus.READY;
+        product.setStatus(toStatus);
+
+        publicationRepository.delete(publication);
+        productRepository.save(product);
+    }
+
+    @Override
+    public void deleteProduct(String productId) {
+        Product product = findProduct(productId);
+        ProductRef productRef = productRefRepository.findFirstByProductId(productId).orElse(null);
+
+        // Unpublish from all portals first
+        publicationRepository.deleteByProductId(productId);
+
+        // Cascade delete remote resources for WORKER/AGENT_SKILL products.
+        cleanupRemoteResources(product);
+
+        // Clear product category relationships
+        clearProductCategoryRelations(productId);
+
+        productRepository.delete(product);
+        deleteLinkedApiDefinition(productRef);
+        productRefRepository.deleteByProductId(productId);
+
+        // Asynchronously clean up product resources
+        eventPublisher.publishEvent(new ProductDeletingEvent(productId));
+    }
+
+    private void deleteLinkedApiDefinition(ProductRef productRef) {
+        if (productRef == null
+                || productRef.getSourceType() == null
+                || !productRef.getSourceType().isApiDefinition()
+                || Strings.isBlank(productRef.getApiDefinitionId())) {
+            return;
+        }
+
+        apiDefinitionRepository
+                .findByApiDefinitionId(productRef.getApiDefinitionId())
+                .ifPresent(apiDefinitionRepository::delete);
+    }
+
+    private void cleanupRemoteResources(Product product) {
+        switch (product.getType()) {
+            case WORKER -> workerService.deleteAgentSpec(product.getProductId(), true);
+            case AGENT_SKILL -> skillService.deleteSkill(product.getProductId(), true);
+            default -> {}
+        }
+    }
+
+    private void validateOnlineVersion(Product product) {
+        if (product.getType() == ProductType.AGENT_SKILL) {
+            List<VersionResult> versions = skillService.listVersions(product.getProductId());
+            if (versions.stream().noneMatch(v -> "online".equals(v.getStatus()))) {
+                throw new BusinessException(
+                        ErrorCode.INVALID_REQUEST, "Cannot publish: no online version found");
+            }
+        } else if (product.getType() == ProductType.WORKER) {
+            List<VersionResult> versions = workerService.listVersions(product.getProductId());
+            if (versions.stream().noneMatch(v -> "online".equals(v.getStatus()))) {
+                throw new BusinessException(
+                        ErrorCode.INVALID_REQUEST, "Cannot publish: no online version found");
+            }
+        }
+    }
+
+    private Product findProduct(String productId) {
+        return productRepository
+                .findByProductId(productId)
+                .orElseThrow(
+                        () ->
+                                new BusinessException(
+                                        ErrorCode.NOT_FOUND, Resources.PRODUCT, productId));
+    }
+
+    @Override
+    public void addProductRef(String productId, AddProductRefParam param) {
+        Product product = findProduct(productId);
+
+        // Check if API reference already exists
+        productRefRepository
+                .findByProductId(product.getProductId())
+                .ifPresent(
+                        productRef -> {
+                            throw new BusinessException(
+                                    ErrorCode.CONFLICT, "Product is already linked to an API");
+                        });
+        ProductRef productRef = param.convertTo();
+        productRef.setProductId(productId);
+        syncConfig(product, productRef);
+
+        // Update status
+        product.setStatus(ProductStatus.READY);
+        productRef.setEnabled(true);
+
+        productRepository.save(product);
+        productRefRepository.save(productRef);
+    }
+
+    @Override
+    public ProductRefResult getProductRef(String productId) {
+        return productRefRepository
+                .findFirstByProductId(productId)
+                .map(productRef -> new ProductRefResult().convertFrom(productRef))
+                .orElse(null);
+    }
+
+    @Override
+    public void deleteProductRef(String productId) {
+        Product product = findProduct(productId);
+        product.setStatus(ProductStatus.PENDING);
+
+        ProductRef productRef =
+                productRefRepository
+                        .findFirstByProductId(productId)
+                        .orElseThrow(
+                                () ->
+                                        new BusinessException(
+                                                ErrorCode.INVALID_REQUEST,
+                                                "API product not linked to API"));
+
+        // Published products cannot be unbound
+        if (publicationRepository.existsByProductId(productId)) {
+            throw new BusinessException(ErrorCode.INVALID_REQUEST, "API product already published");
+        }
+
+        productRefRepository.delete(productRef);
+        productRepository.save(product);
+        productSyncCache.invalidate(productId);
+    }
+
+    @EventListener
+    @Async("taskExecutor")
+    public void onPortalDeletion(PortalDeletingEvent event) {
+        String portalId = event.getPortalId();
+        try {
+            publicationRepository.deleteAllByPortalId(portalId);
+
+            log.info("Completed cleanup publications for portal, portalId={}", portalId);
+        } catch (Exception e) {
+            log.error(
+                    "Failed to unpublish products for portal, portalId={}, errorMessage={}",
+                    portalId,
+                    e.getMessage(),
+                    e);
+        }
+    }
+
+    @Override
+    public Map<String, ProductResult> getProducts(List<String> productIds) {
+        List<Product> products = productRepository.findByProductIdIn(productIds);
+
+        List<ProductResult> productResults =
+                products.stream().map(product -> new ProductResult().convertFrom(product)).toList();
+
+        fillProducts(productResults);
+
+        return productResults.stream()
+                .collect(Collectors.toMap(ProductResult::getProductId, Function.identity()));
+    }
+
+    @Override
+    public PageResult<SubscriptionResult> listProductSubscriptions(
+            String productId, QueryProductSubscriptionParam param, Pageable pageable) {
+        existsProduct(productId);
+        Page<ProductSubscription> subscriptions =
+                subscriptionRepository.findAll(
+                        buildProductSubscriptionSpec(productId, param), pageable);
+
+        List<String> consumerIds =
+                subscriptions.getContent().stream()
+                        .map(ProductSubscription::getConsumerId)
+                        .toList();
+        if (CollectionUtils.isEmpty(consumerIds)) {
+            return PageResult.empty(pageable.getPageNumber(), pageable.getPageSize());
+        }
+
+        Map<String, Consumer> consumers =
+                consumerRepository.findByConsumerIdIn(consumerIds).stream()
+                        .collect(Collectors.toMap(Consumer::getConsumerId, consumer -> consumer));
+
+        return new PageResult<SubscriptionResult>()
+                .convertFrom(
+                        subscriptions,
+                        s -> {
+                            SubscriptionResult r = new SubscriptionResult().convertFrom(s);
+                            Consumer consumer = consumers.get(r.getConsumerId());
+                            if (consumer != null) {
+                                r.setConsumerName(consumer.getName());
+                            }
+                            return r;
+                        });
+    }
+
+    @Override
+    public void existsProduct(String productId) {
+        productRepository
+                .findByProductId(productId)
+                .orElseThrow(
+                        () ->
+                                new BusinessException(
+                                        ErrorCode.NOT_FOUND, Resources.PRODUCT, productId));
+    }
+
+    @Override
+    public void existsProducts(List<String> productIds) {
+        List<String> existedProductIds =
+                productRepository.findByProductIdIn(productIds).stream()
+                        .map(Product::getProductId)
+                        .toList();
+
+        List<String> notFoundProductIds =
+                productIds.stream()
+                        .filter(productId -> !existedProductIds.contains(productId))
+                        .toList();
+
+        if (!notFoundProductIds.isEmpty()) {
+            throw new BusinessException(
+                    ErrorCode.NOT_FOUND, Resources.PRODUCT, String.join(",", notFoundProductIds));
+        }
+    }
+
+    @Override
+    public void setProductCategories(String productId, List<String> categoryIds) {
+        existsProduct(productId);
+
+        productCategoryService.unbindAllProductCategories(productId);
+        productCategoryService.bindProductCategories(productId, categoryIds);
+    }
+
+    @Override
+    public void clearProductCategoryRelations(String productId) {
+        productCategoryService.unbindAllProductCategories(productId);
+    }
+
+    @Override
+    public void reloadProductConfig(String productId) {
+        Product product = findProduct(productId);
+        ProductRef productRef =
+                productRefRepository
+                        .findFirstByProductId(productId)
+                        .orElseThrow(
+                                () ->
+                                        new BusinessException(
+                                                ErrorCode.INVALID_REQUEST,
+                                                "API product not linked to API"));
+
+        // Update cache to prevent immediate re-sync
+        productSyncCache.put(productId, Boolean.TRUE);
+
+        syncConfig(product, productRef);
+        syncMcpTools(product, productRef);
+        productRefRepository.saveAndFlush(productRef);
+    }
+
+    @Override
+    public McpToolListResult listMcpTools(String productId) {
+        Product product =
+                contextHolder.isAdministrator()
+                        ? findProduct(productId)
+                        : findPublishedProduct(contextHolder.getPortal(), productId);
+        if (product.getType() != ProductType.MCP_SERVER) {
+            throw new BusinessException(
+                    ErrorCode.INVALID_REQUEST, "API product is not a mcp server");
+        }
+
+        ProductRef productRef = productRefRepository.findFirstByProductId(productId).orElse(null);
+        McpConfigResult mcpConfig =
+                productRef == null
+                        ? null
+                        : JsonUtil.parse(productRef.getMcpConfig(), McpConfigResult.class);
+        return mcpToolService.listMcpTools(productId, mcpConfig);
+    }
+
+    @Override
+    public void updateProductSource(String productId, UpdateProductSourceParam param) {
+        Product product = findProduct(productId);
+        if (product.getType() != ProductType.AGENT_SKILL
+                && product.getType() != ProductType.WORKER) {
+            throw new BusinessException(ErrorCode.INVALID_REQUEST, "Product type is not supported");
+        }
+
+        SkillRegistryType registryType = resolveSkillRegistryType(param);
+        if (registryType == SkillRegistryType.AIREGISTRY) {
+            if (product.getType() != ProductType.AGENT_SKILL) {
+                throw new BusinessException(
+                        ErrorCode.INVALID_REQUEST, "AIRegistry only supports Agent Skill products");
+            }
+            if (Strings.isBlank(param.getAiRegistryId()) || Strings.isBlank(param.getNamespace())) {
+                throw new BusinessException(
+                        ErrorCode.INVALID_PARAMETER, "AIRegistry ID and namespace are required");
+            }
+            aiRegistryService.getAiRegistryInstance(param.getAiRegistryId());
+            ProductFeature feature = product.getFeature();
+            if (feature == null) {
+                feature = ProductFeature.builder().build();
+            }
+            feature.setSkillConfig(
+                    SkillConfig.builder()
+                            .registryType(SkillRegistryType.AIREGISTRY)
+                            .aiRegistryId(param.getAiRegistryId())
+                            .namespace(param.getNamespace())
+                            .build());
+            product.setFeature(feature);
+            productRepository.save(product);
+            return;
+        }
+
+        if (registryType != SkillRegistryType.NACOS) {
+            throw new BusinessException(
+                    ErrorCode.INVALID_REQUEST, "Only Nacos or AIRegistry source is supported");
+        }
+        if (Strings.isBlank(param.getNacosId()) || Strings.isBlank(param.getNamespace())) {
+            throw new BusinessException(
+                    ErrorCode.INVALID_PARAMETER, "Nacos ID and namespace are required");
+        }
+
+        nacosService.getNacosInstance(param.getNacosId());
+
+        ProductFeature feature = product.getFeature();
+        if (feature == null) {
+            feature = ProductFeature.builder().build();
+        }
+
+        if (product.getType() == ProductType.AGENT_SKILL) {
+            feature.setSkillConfig(
+                    SkillConfig.builder()
+                            .nacosId(param.getNacosId())
+                            .namespace(param.getNamespace())
+                            .build());
+        } else {
+            feature.setWorkerConfig(
+                    WorkerConfig.builder()
+                            .nacosId(param.getNacosId())
+                            .namespace(param.getNamespace())
+                            .build());
+        }
+
+        product.setFeature(feature);
+        productRepository.save(product);
+    }
+
+    private SkillRegistryType resolveSkillRegistryType(UpdateProductSourceParam param) {
+        if (param.getRegistryType() != null) {
+            return param.getRegistryType();
+        }
+        if (param.getSourceType() != null && param.getSourceType().isNacos()) {
+            return SkillRegistryType.NACOS;
+        }
+        throw new BusinessException(ErrorCode.INVALID_PARAMETER, "Skill registry type is required");
+    }
+
+    private void syncConfig(Product product, ProductRef productRef) {
+        SourceType sourceType = productRef.getSourceType();
+
+        if (sourceType.isGateway()) {
+            GatewayResult gateway = gatewayService.getGateway(productRef.getGatewayId());
+
+            // Determine specific configuration type
+            Object config;
+            if (gateway.getGatewayType().isHigress()) {
+                config = productRef.getHigressRefConfig();
+            } else if (gateway.getGatewayType().isAdpAIGateway()) {
+                config = productRef.getAdpAIGatewayRefConfig();
+            } else if (gateway.getGatewayType().isApsaraGateway()) {
+                config = productRef.getApsaraGatewayRefConfig();
+            } else {
+                config = productRef.getApigRefConfig();
+            }
+
+            // Handle different configurations based on product type
+            switch (product.getType()) {
+                case REST_API:
+                    productRef.setApiConfig(
+                            gatewayService.fetchAPIConfig(gateway.getGatewayId(), config));
+                    break;
+                case MCP_SERVER:
+                    productRef.setMcpConfig(
+                            gatewayService.fetchMcpConfig(gateway.getGatewayId(), config));
+                    break;
+                case AGENT_API:
+                    productRef.setAgentConfig(
+                            gatewayService.fetchAgentConfig(gateway.getGatewayId(), config));
+                    break;
+                case MODEL_API:
+                    productRef.setModelConfig(
+                            gatewayService.fetchModelConfig(gateway.getGatewayId(), config));
+                    break;
+            }
+        } else if (sourceType.isNacos()) {
+            // Handle Nacos configuration
+            NacosRefConfig nacosRefConfig = productRef.getNacosRefConfig();
+            if (nacosRefConfig == null) {
+                throw new BusinessException(
+                        ErrorCode.INVALID_REQUEST, "Nacos reference config is required");
+            }
+
+            switch (product.getType()) {
+                case MCP_SERVER:
+                    String mcpConfig =
+                            nacosService.fetchMcpConfig(productRef.getNacosId(), nacosRefConfig);
+                    productRef.setMcpConfig(mcpConfig);
+                    break;
+
+                case AGENT_API:
+                    String agentConfig =
+                            nacosService.fetchAgentConfig(productRef.getNacosId(), nacosRefConfig);
+                    productRef.setAgentConfig(agentConfig);
+                    break;
+
+                default:
+                    throw new BusinessException(
+                            ErrorCode.INVALID_REQUEST,
+                            String.format(
+                                    "Nacos source does not support product type: %s",
+                                    product.getType()));
+            }
+        }
+    }
+
+    private void syncMcpTools(Product product, ProductRef productRef) {
+        if (product.getType() != ProductType.MCP_SERVER) {
+            return;
+        }
+
+        String mcpConfigJson = productRef.getMcpConfig();
+        if (mcpConfigJson == null) {
+            return;
+        }
+        McpConfigResult mcpConfig = JsonUtil.parse(mcpConfigJson, McpConfigResult.class);
+        if (mcpConfig == null) {
+            return;
+        }
+
+        CredentialContext credential = new CredentialContext();
+        if (productRef.getSourceType() == SourceType.GATEWAY) {
+            try {
+                credential =
+                        gatewayService.fetchApiCredential(
+                                productRef.getGatewayId(), product.getType(), productRef);
+            } catch (Exception e) {
+                log.warn(
+                        "Failed to fetch API credential, productId={}, errorMessage={}",
+                        productRef.getProductId(),
+                        e.getMessage(),
+                        e);
+            }
+        }
+
+        String toolsConfig = mcpToolService.fetchToolsConfig(mcpConfig, credential);
+        if (Strings.isBlank(toolsConfig)) {
+            return;
+        }
+        mcpConfig.setTools(toolsConfig);
+        productRef.setMcpConfig(JsonUtil.toJson(mcpConfig));
+    }
+
+    /**
+     * Fill product details, including product categories and product reference config.
+     *
+     * @param products the list of products to fill
+     */
+    private void fillProducts(List<ProductResult> products) {
+        if (CollectionUtils.isEmpty(products)) {
+            return;
+        }
+
+        List<String> productIds = products.stream().map(ProductResult::getProductId).toList();
+
+        Map<String, ProductRef> productRefMap =
+                productRefRepository.findByProductIdIn(productIds).stream()
+                        .collect(Collectors.toMap(ProductRef::getProductId, ref -> ref));
+
+        Map<String, List<ProductCategoryResult>> categoriesMap =
+                productCategoryService.listCategoriesForProducts(productIds);
+
+        for (ProductResult product : products) {
+            String productId = product.getProductId();
+
+            // Fill Categories
+            product.setCategories(categoriesMap.getOrDefault(productId, Collections.emptyList()));
+
+            // Fill ProductRef config
+            ProductRef productRef = productRefMap.get(productId);
+            if (productRef != null) {
+                fillProductConfig(product, productRef);
+            }
+
+            // Fill skill config from feature
+            if (product.getFeature() != null && product.getFeature().getSkillConfig() != null) {
+                product.setSkillConfig(product.getFeature().getSkillConfig());
+            }
+
+            // Fill agent spec config from feature
+            if (product.getFeature() != null && product.getFeature().getWorkerConfig() != null) {
+                product.setWorkerConfig(product.getFeature().getWorkerConfig());
+            }
+        }
+    }
+
+    /**
+     * Fill product config from product reference.
+     *
+     * @param product    the product result to fill
+     * @param productRef the product reference containing config data
+     */
+    private void fillProductConfig(ProductResult product, ProductRef productRef) {
+        product.setEnabled(productRef.getEnabled());
+        product.setSubscribable(
+                productRef.getSourceType() != null && productRef.getSourceType().isGateway());
+
+        // API config for REST API
+        if (Strings.isNotBlank(productRef.getApiConfig())) {
+            product.setApiConfig(JsonUtil.parse(productRef.getApiConfig(), APIConfigResult.class));
+        }
+
+        // MCP config for MCP Server
+        if (Strings.isNotBlank(productRef.getMcpConfig())) {
+            product.setMcpConfig(JsonUtil.parse(productRef.getMcpConfig(), McpConfigResult.class));
+        }
+
+        // Agent config for Agent API
+        if (Strings.isNotBlank(productRef.getAgentConfig())) {
+            product.setAgentConfig(
+                    JsonUtil.parse(productRef.getAgentConfig(), AgentConfigResult.class));
+        }
+
+        // Model config for Model API
+        if (Strings.isNotBlank(productRef.getModelConfig())) {
+            product.setModelConfig(
+                    JsonUtil.parse(productRef.getModelConfig(), ModelConfigResult.class));
+        }
+    }
+
+    private Product findPublishedProduct(String portalId, String productId) {
+        ProductPublication publication =
+                publicationRepository
+                        .findByPortalIdAndProductId(portalId, productId)
+                        .orElseThrow(
+                                () ->
+                                        new BusinessException(
+                                                ErrorCode.NOT_FOUND, Resources.PRODUCT, productId));
+
+        return findProduct(publication.getProductId());
+    }
+
+    private Specification<Product> buildSpecification(QueryProductParam param) {
+        return (root, query, cb) -> {
+            List<Predicate> predicates = new ArrayList<>();
+
+            if (Strings.isNotBlank(param.getPortalId())) {
+                Subquery<String> subquery = query.subquery(String.class);
+                Root<ProductPublication> publicationRoot = subquery.from(ProductPublication.class);
+                subquery.select(publicationRoot.get("productId"))
+                        .where(cb.equal(publicationRoot.get("portalId"), param.getPortalId()));
+                predicates.add(root.get("productId").in(subquery));
+            }
+
+            if (param.getType() != null) {
+                predicates.add(cb.equal(root.get("type"), param.getType()));
+            }
+
+            if (param.getStatus() != null) {
+                predicates.add(cb.equal(root.get("status"), param.getStatus()));
+            }
+
+            if (Strings.isNotBlank(param.getName())) {
+                String likePattern = "%" + param.getName() + "%";
+                predicates.add(cb.like(root.get("name"), likePattern));
+            }
+
+            if (!CollectionUtils.isEmpty(param.getCategoryIds())) {
+                Subquery<String> subquery = query.subquery(String.class);
+                Root<ProductCategoryRelation> relationRoot =
+                        subquery.from(ProductCategoryRelation.class);
+                subquery.select(relationRoot.get("productId"))
+                        .where(relationRoot.get("categoryId").in(param.getCategoryIds()));
+                predicates.add(root.get("productId").in(subquery));
+            }
+
+            if (Strings.isNotBlank(param.getExcludeCategoryId())) {
+                Subquery<String> subquery = query.subquery(String.class);
+                Root<ProductCategoryRelation> relationRoot =
+                        subquery.from(ProductCategoryRelation.class);
+                subquery.select(relationRoot.get("productId"))
+                        .where(
+                                cb.equal(
+                                        relationRoot.get("categoryId"),
+                                        param.getExcludeCategoryId()));
+                predicates.add(cb.not(root.get("productId").in(subquery)));
+            }
+
+            if (param.getSortBy() == ProductSortBy.DOWNLOAD_COUNT
+                    && (param.getType() == ProductType.AGENT_SKILL
+                            || param.getType() == ProductType.WORKER)) {
+                applyDownloadCountSort(root, query, cb, param.getType());
+            }
+
+            return cb.and(predicates.toArray(new Predicate[0]));
+        };
+    }
+
+    private void applyDownloadCountSort(
+            Root<Product> product,
+            CriteriaQuery<?> query,
+            CriteriaBuilder criteriaBuilder,
+            ProductType productType) {
+        if (Long.class.equals(query.getResultType()) || long.class.equals(query.getResultType())) {
+            return;
+        }
+
+        String jsonPath =
+                productType == ProductType.AGENT_SKILL
+                        ? "$.skillConfig.downloadCount"
+                        : "$.workerConfig.downloadCount";
+        Expression<String> extractedValue =
+                criteriaBuilder.function(
+                        "json_extract",
+                        String.class,
+                        product.get("feature"),
+                        criteriaBuilder.literal(jsonPath));
+        Expression<Long> downloadCount =
+                criteriaBuilder.coalesce(extractedValue.as(Long.class), 0L);
+
+        query.orderBy(criteriaBuilder.desc(downloadCount), criteriaBuilder.desc(product.get("id")));
+    }
+
+    private Specification<ProductSubscription> buildProductSubscriptionSpec(
+            String productId, QueryProductSubscriptionParam param) {
+        return (root, query, cb) -> {
+            List<Predicate> predicates = new ArrayList<>();
+            predicates.add(cb.equal(root.get("productId"), productId));
+
+            // If developer, can only view own consumer subscriptions
+            if (contextHolder.isDeveloper()) {
+                Subquery<String> consumerSubquery = query.subquery(String.class);
+                Root<Consumer> consumerRoot = consumerSubquery.from(Consumer.class);
+                consumerSubquery
+                        .select(consumerRoot.get("consumerId"))
+                        .where(cb.equal(consumerRoot.get("developerId"), contextHolder.getUser()));
+
+                predicates.add(root.get("consumerId").in(consumerSubquery));
+            }
+
+            if (param.getStatus() != null) {
+                predicates.add(cb.equal(root.get("status"), param.getStatus()));
+            }
+
+            if (Strings.isNotBlank(param.getConsumerName())) {
+                Subquery<String> consumerSubquery = query.subquery(String.class);
+                Root<Consumer> consumerRoot = consumerSubquery.from(Consumer.class);
+
+                consumerSubquery
+                        .select(consumerRoot.get("consumerId"))
+                        .where(
+                                cb.like(
+                                        cb.lower(consumerRoot.get("name")),
+                                        "%" + param.getConsumerName().toLowerCase() + "%"));
+
+                predicates.add(root.get("consumerId").in(consumerSubquery));
+            }
+
+            return cb.and(predicates.toArray(new Predicate[0]));
+        };
+    }
+
+    @EventListener
+    @Async("taskExecutor")
+    public void onProductConfigReload(ProductConfigReloadEvent event) {
+        String productId = event.getProductId();
+
+        try {
+            // Double-check cache to prevent concurrent duplicate syncs
+            if (productSyncCache.getIfPresent(productId) == null) {
+                return;
+            }
+
+            ProductRef productRef =
+                    productRefRepository.findFirstByProductId(productId).orElse(null);
+            if (productRef == null) {
+                return;
+            }
+
+            Product product = productRepository.findByProductId(productId).orElse(null);
+            if (product == null) {
+                return;
+            }
+
+            syncConfig(product, productRef);
+            syncMcpTools(product, productRef);
+
+            productRefRepository.save(productRef);
+
+            log.info("Auto-sync product ref completed, productId={}", productId);
+        } catch (Exception e) {
+            log.warn(
+                    "Failed to auto-sync product ref, productId={}, errorMessage={}",
+                    productId,
+                    e.getMessage(),
+                    e);
+        }
+    }
+
+    private PageResult<ProductResult> listProductsSortedByDownloadCount(
+            QueryProductParam param, Pageable pageable) {
+        Pageable unsortedPageable =
+                PageRequest.of(pageable.getPageNumber(), pageable.getPageSize());
+        Page<Product> page = productRepository.findAll(buildSpecification(param), unsortedPageable);
+
+        List<ProductResult> results =
+                page.stream().map(product -> new ProductResult().convertFrom(product)).toList();
+
+        fillProducts(results);
+
+        return PageResult.of(
+                results, page.getNumber() + 1, page.getSize(), page.getTotalElements());
+    }
+
+    /**
+     * List products with type-specific filter.
+     * Filter is used to match specific properties in Product Config (e.g., ModelAPIConfig, APIConfig).
+     *
+     * @param param    query parameters including product type and filter
+     * @param pageable pagination settings
+     * @return paginated product results
+     */
+    private PageResult<ProductResult> listProductsWithFilter(
+            QueryProductParam param, Pageable pageable) {
+        List<Product> allProducts = productRepository.findAll(buildSpecification(param));
+
+        if (CollectionUtils.isEmpty(allProducts)) {
+            return PageResult.empty(pageable.getPageNumber(), pageable.getPageSize());
+        }
+
+        Map<String, ProductRef> productRefMap =
+                productRefRepository
+                        .findByProductIdIn(allProducts.stream().map(Product::getProductId).toList())
+                        .stream()
+                        .collect(Collectors.toMap(ProductRef::getProductId, ref -> ref));
+
+        List<Product> targetProducts = new ArrayList<>();
+        for (Product product : allProducts) {
+            ProductRef productRef = productRefMap.get(product.getProductId());
+            if (!matchesFilter(productRef, param)) {
+                continue;
+            }
+
+            targetProducts.add(product);
+        }
+
+        // Manual pagination
+        int start = (int) pageable.getOffset();
+        int end = Math.min(start + pageable.getPageSize(), targetProducts.size());
+        List<Product> pageContent =
+                start < targetProducts.size()
+                        ? targetProducts.subList(start, end)
+                        : Collections.emptyList();
+
+        List<ProductResult> results =
+                pageContent.stream()
+                        .map(product -> new ProductResult().convertFrom(product))
+                        .toList();
+
+        fillProducts(results);
+
+        return PageResult.of(
+                results,
+                pageable.getPageNumber() + 1,
+                pageable.getPageSize(),
+                targetProducts.size());
+    }
+
+    /**
+     * Check if product matches the type-specific filter
+     *
+     * @param productRef the product reference containing config data
+     * @param param      query parameters containing filter criteria
+     * @return true if product matches the filter, false otherwise
+     */
+    private boolean matchesFilter(ProductRef productRef, QueryProductParam param) {
+        if (productRef == null || Strings.isBlank(productRef.getModelConfig())) {
+            return false;
+        }
+
+        // MODEL_API type: use ModelFilter
+        if (param.getType() == ProductType.MODEL_API && param.getModelFilter() != null) {
+            try {
+                ModelConfigResult config =
+                        JsonUtil.parse(productRef.getModelConfig(), ModelConfigResult.class);
+                return param.getModelFilter().matches(config);
+            } catch (Exception e) {
+                log.warn(
+                        "Failed to parse modelConfig for product, productId={}, errorMessage={}",
+                        productRef.getProductId(),
+                        e.getMessage(),
+                        e);
+                return false;
+            }
+        }
+
+        // TODO: Add other filter types here.
+        // if (param.getType() == ProductType.AGENT && param.getAgentFilter() != null) {
+        //     ...
+        // }
+
+        // No filter specified or no matching filter type, pass through
+        return true;
+    }
+}

@@ -1,0 +1,784 @@
+import { message } from 'antd';
+import axios from 'axios';
+
+import type {
+  CreatePortalRequest,
+  UpdatePortalRequest,
+  UpdatePortalSettingsRequest,
+  GetApiProductsParams,
+  CreateApiProductRequest,
+  UpdateApiProductRequest,
+  GetApiProductPublicationsParams,
+  GetGatewaysParams,
+  GetApigGatewayParams,
+  GetApsaraGatewaysRequest,
+  GetAdpGatewaysRequest,
+  ImportGatewayRequest,
+  UpdateGatewayRequest,
+  GetGatewayApisParams,
+  GetNacosParams,
+  GetAiRegistryParams,
+  CreateNacosRequest,
+  CreateAiRegistryRequest,
+  UpdateNacosRequest,
+  UpdateAiRegistryRequest,
+  GetNacosMcpServersParams,
+  AgentSpecCard,
+  SkillCard,
+} from '@/types';
+
+import { getToken, removeToken } from './utils';
+
+import type { AxiosInstance, AxiosResponse, InternalAxiosRequestConfig } from 'axios';
+
+const api: AxiosInstance = axios.create({
+  baseURL: import.meta.env.VITE_API_BASE_URL,
+  headers: {
+    'Content-Type': 'application/json',
+  },
+  timeout: 10000,
+  withCredentials: true, // 确保跨域请求时携带 cookie
+});
+
+function getReadableApiErrorMessage(error: unknown) {
+  if (!axios.isAxiosError(error)) {
+    return '请求发生错误';
+  }
+
+  const data = error.response?.data as { message?: unknown } | undefined;
+  const rawMessage = typeof data?.message === 'string' ? data.message.trim() : '';
+
+  if (!rawMessage) {
+    return '请求发生错误';
+  }
+
+  const isInternalDetail =
+    rawMessage.includes('JDBC exception') ||
+    rawMessage.includes('Internal server error') ||
+    rawMessage.includes('org.springframework') ||
+    rawMessage.length > 120;
+
+  return isInternalDetail ? '服务暂时不可用，请稍后重试' : rawMessage;
+}
+
+const AUTH_ENDPOINTS = ['/admins/init', '/admins/need-init', '/admins/login'] as const;
+
+function isAuthEndpointRequest(url: string | undefined) {
+  if (!url) {
+    return false;
+  }
+
+  const requestPath = url.split('?')[0] || '';
+  return AUTH_ENDPOINTS.some((path) => requestPath.endsWith(path));
+}
+
+function shouldRedirectToLogin(error: unknown) {
+  if (!axios.isAxiosError(error)) {
+    return false;
+  }
+
+  const status = error.response?.status;
+  const isUnauthorized = status === 403 || status === 401;
+  if (!isUnauthorized) {
+    return false;
+  }
+
+  return window.location.pathname !== '/login' && !isAuthEndpointRequest(error.config?.url);
+}
+
+// 请求拦截器
+api.interceptors.request.use(
+  (config: InternalAxiosRequestConfig) => {
+    const token = getToken();
+    if (token && config.headers) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  },
+  (error) => {
+    return Promise.reject(error);
+  },
+);
+
+// 响应拦截器
+api.interceptors.response.use(
+  (response: AxiosResponse) => {
+    return response.data;
+  },
+  (error) => {
+    const shouldHandleLocally =
+      axios.isAxiosError(error) && isAuthEndpointRequest(error.config?.url);
+
+    if (!shouldHandleLocally) {
+      message.error({
+        content: getReadableApiErrorMessage(error),
+        key: 'api-error',
+      });
+    }
+
+    if (shouldRedirectToLogin(error)) {
+      removeToken();
+      window.location.href = '/login';
+    }
+    return Promise.reject(error);
+  },
+);
+
+export default api;
+
+// 用户相关API
+export const authApi = {
+  changePassword: (data: { newPassword: string; oldPassword: string }) => {
+    return api.patch('/admins/password', data);
+  },
+  getNeedInit: () => {
+    return api.get('/admins/need-init');
+  },
+};
+
+export interface AdminSettingResult {
+  settingKey: string;
+  settingValue?: string;
+}
+
+// Admin settings APIs
+export const adminSettingApi = {
+  getSetting: (settingKey: string) => {
+    return api.get(`/admin-settings/${encodeURIComponent(settingKey)}`);
+  },
+  saveSetting: (settingKey: string, settingValue: string) => {
+    return api.put(`/admin-settings/${encodeURIComponent(settingKey)}`, { settingValue });
+  },
+};
+
+// Portal相关API
+export const portalApi = {
+  // 审批consumer
+  approveConsumer: (consumerId: string) => {
+    return api.patch(`/consumers/${consumerId}/status`);
+  },
+  // 审批订阅申请
+  approveSubscription: (consumerId: string, productId: string) => {
+    return api.patch(`/consumers/${consumerId}/subscriptions/${productId}`);
+  },
+  // 绑定域名
+  bindDomain: (portalId: string, domainData: { domain: string; type: string }) => {
+    return api.post(`/portals/${portalId}/domains`, domainData);
+  },
+  createPortal: (data: CreatePortalRequest) => {
+    return api.post(`/portals`, data);
+  },
+  deleteDeveloper: (developerId: string) => {
+    return api.delete(`/developers/${developerId}`);
+  },
+  deletePortal: (portalId: string) => {
+    return api.delete(`/portals/${portalId}`);
+  },
+  // 删除订阅
+  deleteSubscription: (consumerId: string, productId: string) => {
+    return api.delete(`/consumers/${consumerId}/subscriptions/${productId}`);
+  },
+  getConsumerList: (
+    portalId: string,
+    developerId: string,
+    params?: { page?: number; size?: number; name?: string },
+  ) => {
+    return api.get(`/consumers`, {
+      params: {
+        developerId,
+        portalId,
+        ...params,
+      },
+    });
+  },
+  // 获取Consumer的订阅列表
+  getConsumerSubscriptions: (
+    consumerId: string,
+    params?: { page?: number; size?: number; status?: string; productName?: string },
+  ) => {
+    return api.get(`/consumers/${consumerId}/subscriptions`, { params });
+  },
+  // 获取Portal的开发者列表
+  getDeveloperList: (portalId: string, pagination?: { page: number; size: number }) => {
+    return api.get(`/developers`, {
+      params: {
+        portalId,
+        ...pagination,
+      },
+    });
+  },
+  // 获取Portal Dashboard URL
+  getPortalDashboard: (portalId: string, type: string = 'Portal') => {
+    return api.get(`/portals/${portalId}/dashboard`, { params: { type } });
+  },
+  // 获取portal详情
+  getPortalDetail: (portalId: string) => {
+    return api.get(`/portals/${portalId}`);
+  },
+  // 获取Portal已发布的产品列表
+  getPortalPublications: (portalId: string, params?: { page?: number; size?: number }) => {
+    return api.get(`/portals/${portalId}/publications`, { params });
+  },
+  // 获取portal列表
+  getPortals: (params?: { page?: number; size?: number }) => {
+    return api.get(`/portals`, { params });
+  },
+  // 解绑域名
+  unbindDomain: (portalId: string, domain: string) => {
+    const encodedDomain = encodeURIComponent(domain);
+    return api.delete(`/portals/${portalId}/domains/${encodedDomain}`);
+  },
+  // 更新开发者状态
+  updateDeveloperStatus: (portalId: string, developerId: string, status: string) => {
+    return api.patch(`/developers/${developerId}/status`, {
+      portalId,
+      status,
+    });
+  },
+  // 更新Portal
+  updatePortal: (portalId: string, data: UpdatePortalRequest) => {
+    return api.put(`/portals/${portalId}`, data);
+  },
+  // 更新Portal设置
+  updatePortalSettings: (portalId: string, settings: UpdatePortalSettingsRequest) => {
+    return api.put(`/portals/${portalId}/setting`, settings);
+  },
+};
+
+// API Product相关API
+export const apiProductApi = {
+  // 取消发布API产品到门户
+  cancelPublishToPortal: (productId: string, publicationId: string) => {
+    return api.delete(`/products/${productId}/publications/${publicationId}`);
+  },
+  // 创建API产品
+  createApiProduct: (data: CreateApiProductRequest) => {
+    return api.post(`/products`, data);
+  },
+  // 创建API产品关联
+  createApiProductRef: (productId: string, data: unknown) => {
+    return api.put(`/products/${productId}/ref`, data);
+  },
+  // 删除API产品
+  deleteApiProduct: (productId: string) => {
+    return api.delete(`/products/${productId}`);
+  },
+  // 删除API产品关联
+  deleteApiProductRef: (productId: string) => {
+    return api.delete(`/products/${productId}/ref`);
+  },
+  // 获取API产品详情
+  getApiProductDetail: (productId: string) => {
+    return api.get(`/products/${productId}`);
+  },
+  // 获取API产品已发布的门户列表
+  getApiProductPublications: (productId: string, params?: GetApiProductPublicationsParams) => {
+    return api.get(`/products/${productId}/publications`, { params });
+  },
+  // 获取API产品关联的服务
+  getApiProductRef: (productId: string) => {
+    return api.get(`/products/${productId}/ref`);
+  },
+  // 获取API产品列表
+  getApiProducts: (params?: GetApiProductsParams) => {
+    return api.get(`/products`, { params });
+  },
+  // 获取产品关联的类别
+  getProductCategories: (productId: string) => {
+    return api.get(`/products/${productId}/categories`);
+  },
+  // 获取API产品的Dashboard监控面板URL
+  getProductDashboard: (productId: string) => {
+    return api.get(`/products/${productId}/dashboard`);
+  },
+  // 获取产品的订阅列表
+  getProductSubscriptions: (
+    productId: string,
+    params?: { page?: number; size?: number; status?: string },
+  ) => {
+    return api.get(`/products/${productId}/subscriptions`, { params });
+  },
+  // 批量导入 AI API 资源为产品
+  importProducts: (data: {
+    productType: string;
+    source: 'GATEWAY' | 'NACOS' | 'AIREGISTRY' | 'EXTERNAL';
+    sourceConfig:
+      | { instanceId: string }
+      | { instanceId: string; namespace?: string }
+      | { instanceId: string; namespace: string }
+      | { provider: string };
+    items: Array<{
+      resourceName?: string;
+      resourceId?: string;
+      description?: string;
+    }>;
+  }) => {
+    return api.post(`/products/import`, data, { timeout: 300000 });
+  },
+  // 发布API产品到门户
+  publishToPortal: (productId: string, portalId: string) => {
+    return api.post(`/products/${productId}/publications`, { portalId });
+  },
+  // 重新加载产品配置
+  reloadProductConfig: (productId: string) => {
+    return api.post(`/products/${productId}/configurations/reload`);
+  },
+  // 更新API产品
+  updateApiProduct: (productId: string, data: UpdateApiProductRequest) => {
+    return api.put(`/products/${productId}`, data);
+  },
+  // 更新产品来源
+  updateProductSource: (
+    productId: string,
+    data:
+      | { registryType: 'NACOS'; sourceType?: 'NACOS'; nacosId: string; namespace: string }
+      | { registryType: 'AIREGISTRY'; airegistryId: string; namespace: string },
+  ) => {
+    return api.put(`/products/${productId}/source`, data);
+  },
+};
+
+// Gateway相关API
+export const gatewayApi = {
+  // 删除网关
+  deleteGateway: (gatewayId: string) => {
+    return api.delete(`/gateways/${gatewayId}`);
+  },
+  // 获取ADP网关
+  getAdpGateways: (data: GetAdpGatewaysRequest) => {
+    return api.post(`/gateways/adp`, data);
+  },
+  // 获取APIG网关
+  getApigGateway: (data: GetApigGatewayParams) => {
+    return api.get(`/gateways/apig`, {
+      params: {
+        ...data,
+      },
+    });
+  },
+  // 获取Apsara网关
+  getApsaraGateways: (data: GetApsaraGatewaysRequest) => {
+    return api.post(`/gateways/apsara`, data);
+  },
+  // 获取网关的Dashboard URL
+  getDashboard: (gatewayId: string) => {
+    return api.get(`/gateways/${gatewayId}/dashboard`);
+  },
+  // 获取网关的Agent API列表
+  getGatewayAgentApis: (gatewayId: string, data: GetGatewayApisParams) => {
+    return api.get(`/gateways/${gatewayId}/agent-apis`, {
+      params: data,
+    });
+  },
+  // 获取网关的MCP Server列表
+  getGatewayMcpServers: (gatewayId: string, data: GetGatewayApisParams) => {
+    return api.get(`/gateways/${gatewayId}/mcp-servers`, {
+      params: data,
+    });
+  },
+  // 获取网关的Model API列表
+  getGatewayModelApis: (gatewayId: string, data: GetGatewayApisParams) => {
+    return api.get(`/gateways/${gatewayId}/model-apis`, {
+      params: data,
+    });
+  },
+  // 获取网关的REST API列表
+  getGatewayRestApis: (gatewayId: string, data: GetGatewayApisParams) => {
+    return api.get(`/gateways/${gatewayId}/rest-apis`, {
+      params: data,
+    });
+  },
+  // 获取网关列表
+  getGateways: (params?: GetGatewaysParams) => {
+    return api.get(`/gateways`, { params });
+  },
+  // 导入网关
+  importGateway: (data: ImportGatewayRequest) => {
+    return api.post(`/gateways`, { ...data });
+  },
+  // 更新网关
+  updateGateway: (gatewayId: string, data: UpdateGatewayRequest) => {
+    return api.put(`/gateways/${gatewayId}`, data);
+  },
+};
+
+export const nacosApi = {
+  createNacos: (data: CreateNacosRequest) => {
+    return api.post(`/nacos`, data);
+  },
+  deleteNacos: (nacosId: string) => {
+    return api.delete(`/nacos/${nacosId}`);
+  },
+  // 获取默认 Nacos 实例
+  getDefaultNacos: () => {
+    return api.get(`/nacos/default`);
+  },
+  // 从阿里云 MSE 获取 Nacos 集群列表
+  getMseNacos: (params: {
+    regionId: string;
+    accessKey: string;
+    secretKey: string;
+    page?: number;
+    size?: number;
+  }) => {
+    return api.get(`/nacos/mse`, { params });
+  },
+  getNacos: (params?: GetNacosParams) => {
+    return api.get(`/nacos`, { params });
+  },
+  // 获取 Nacos Agent 列表
+  getNacosAgents: (
+    nacosId: string,
+    params?: {
+      page?: number;
+      size?: number;
+      namespaceId?: string;
+    },
+  ) => {
+    return api.get(`/nacos/${nacosId}/agents`, { params });
+  },
+  getNacosMcpServers: (nacosId: string, data: GetNacosMcpServersParams) => {
+    return api.get(`/nacos/${nacosId}/mcp-servers`, {
+      params: data,
+    });
+  },
+  getNacosSkills: (
+    nacosId: string,
+    params?: {
+      page?: number;
+      size?: number;
+      namespaceId?: string;
+    },
+  ) => {
+    return api.get(`/nacos/${nacosId}/skills`, { params });
+  },
+  // 获取指定 Nacos 实例的命名空间列表
+  getNamespaces: (nacosId: string, params?: { page?: number; size?: number }) => {
+    return api.get(`/nacos/${nacosId}/namespaces`, { params });
+  },
+  // 设置默认 Nacos 实例，可同步指定默认命名空间
+  setDefaultNacos: (nacosId: string, namespaceId?: string) => {
+    return api.put(`/nacos/${nacosId}/default`, null, {
+      params: namespaceId ? { namespaceId } : undefined,
+    });
+  },
+  updateNacos: (nacosId: string, data: UpdateNacosRequest) => {
+    return api.put(`/nacos/${nacosId}`, data);
+  },
+};
+
+export const airegistryApi = {
+  create: (data: CreateAiRegistryRequest) => {
+    return api.post(`/airegistries`, data);
+  },
+  delete: (airegistryId: string) => {
+    return api.delete(`/airegistries/${airegistryId}`);
+  },
+  getDefault: () => {
+    return api.get(`/airegistries/default`);
+  },
+  getSkills: (
+    airegistryId: string,
+    params: { namespaceId: string; page?: number; size?: number },
+  ) => {
+    return api.get(`/airegistries/${airegistryId}/skills`, { params });
+  },
+  list: (params?: GetAiRegistryParams) => {
+    return api.get(`/airegistries`, { params });
+  },
+  setDefault: (airegistryId: string, namespaceId?: string) => {
+    return api.put(`/airegistries/${airegistryId}/default`, null, {
+      params: namespaceId ? { namespaceId } : undefined,
+    });
+  },
+  update: (airegistryId: string, data: UpdateAiRegistryRequest) => {
+    return api.put(`/airegistries/${airegistryId}`, data);
+  },
+  validate: (airegistryId: string, namespaceId?: string) => {
+    return api.post(`/airegistries/${airegistryId}/validate`, null, {
+      params: namespaceId ? { namespaceId } : undefined,
+    });
+  },
+};
+
+export const workerApi = {
+  createDraft: (productId: string, data: { baseVersion: string }) =>
+    api.post(`/workers/${productId}/draft`, data),
+  delete: (productId: string) => api.delete(`/workers/${productId}`),
+  deleteDraft: (productId: string) => api.delete(`/workers/${productId}/draft`),
+  getDownloadUrl: (productId: string) =>
+    `${import.meta.env.VITE_API_BASE_URL}/workers/${productId}/download`,
+  getDraft: (productId: string) => api.get(`/workers/${productId}/draft`),
+  getFileContent: (productId: string, filePath: string, version?: string) =>
+    api.get(`/workers/${productId}/files/${filePath}`, { params: { version } }),
+  getFiles: (productId: string, version?: string) =>
+    api.get(`/workers/${productId}/files`, { params: { version } }),
+  getVersions: (productId: string) => api.get(`/workers/${productId}/versions`),
+  // 从 Nacos 导入 Workers
+  importFromNacos: (nacosId: string, namespace?: string) => {
+    return api.post(`/workers/import`, null, { params: { nacosId, namespace }, timeout: 120000 });
+  },
+  offlineVersion: (productId: string, version: string) =>
+    api.patch(`/workers/${productId}/versions/${version}`, { status: 'offline' }),
+  onlineVersion: (productId: string, version: string) =>
+    api.patch(`/workers/${productId}/versions/${version}`, { status: 'online' }),
+  publishApprovedVersion: (productId: string, version: string) =>
+    api.patch(`/workers/${productId}/versions/${version}`, { status: 'online' }),
+  setLatestVersion: (productId: string, version: string) =>
+    api.patch(`/workers/${productId}/versions/${version}`, { latest: true }),
+  submitVersion: (productId: string, version: string) =>
+    api.patch(`/workers/${productId}/versions/${version}`, { status: 'reviewing' }),
+  updateDraft: (productId: string, agentSpecCard: AgentSpecCard) =>
+    api.put(`/workers/${productId}/draft`, { agentSpecCard }),
+  updateVersionAuthor: (productId: string, version: string, author: string) =>
+    api.patch(`/workers/${productId}/versions/${version}`, { author }),
+  uploadPackage: (productId: string, file: File) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    return api.post(`/workers/${productId}/package`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60000,
+    });
+  },
+};
+
+export const skillApi = {
+  createDraft: (productId: string, data: { baseVersion: string; version: string }) =>
+    api.post(`/skills/${productId}/draft`, data),
+  deleteDraft: (productId: string) => api.delete(`/skills/${productId}/draft`),
+  forcePublishVersion: (productId: string, version: string) =>
+    api.patch(`/skills/${productId}/versions/${version}`, {
+      force: true,
+      status: 'online',
+      updateLatestLabel: true,
+    }),
+  getDownloadUrl: (productId: string) =>
+    `${import.meta.env.VITE_API_BASE_URL}/skills/${productId}/download`,
+  getDraft: (productId: string) => api.get(`/skills/${productId}/draft`),
+  getSkillFileContent: (productId: string, filePath: string, version?: string) =>
+    api.get(`/skills/${productId}/files/${filePath}`, { params: { version } }),
+  getSkillFiles: (productId: string, version?: string) =>
+    api.get(`/skills/${productId}/files`, { params: { version } }),
+  getVersions: (productId: string) => api.get(`/skills/${productId}/versions`),
+  // 从 Nacos 导入 Skills
+  importFromNacos: (nacosId: string, namespace?: string) => {
+    return api.post(`/skills/import`, null, { params: { nacosId, namespace }, timeout: 120000 });
+  },
+  offlineVersion: (productId: string, version: string) =>
+    api.patch(`/skills/${productId}/versions/${version}`, { status: 'offline' }),
+  onlineVersion: (productId: string, version: string) =>
+    api.patch(`/skills/${productId}/versions/${version}`, { status: 'online' }),
+  publishApprovedVersion: (productId: string, version: string) =>
+    api.patch(`/skills/${productId}/versions/${version}`, { status: 'online' }),
+  setLatestVersion: (productId: string, version: string) =>
+    api.patch(`/skills/${productId}/versions/${version}`, { latest: true }),
+  submitVersion: (productId: string, version: string) =>
+    api.patch(`/skills/${productId}/versions/${version}`, { status: 'reviewing' }),
+  updateDraft: (productId: string, skillCard: SkillCard) =>
+    api.put(`/skills/${productId}/draft`, { skillCard }),
+  updateVersionAuthor: (productId: string, version: string, author: string) =>
+    api.patch(`/skills/${productId}/versions/${version}`, { author }),
+  uploadSkillPackage: (productId: string, file: File) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    return api.post(`/skills/${productId}/package`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60000,
+    });
+  },
+};
+
+// MCP Server 管理 API
+export const mcpServerApi = {
+  // 删除 endpoint
+  deleteEndpoint: (endpointId: string) => {
+    return api.delete(`/mcp-servers/endpoints/${endpointId}`);
+  },
+  // 删除 MCP 元信息
+  deleteMeta: (mcpServerId: string) => {
+    return api.delete(`/mcp-servers/meta/${mcpServerId}`);
+  },
+  // 删除产品下所有 MCP 配置（meta + endpoint + ref + 重置状态）
+  deleteMetaByProduct: (productId: string) => {
+    return api.delete(`/mcp-servers/meta/by-product/${productId}`);
+  },
+  // 获取 MCP 元信息
+  getMeta: (mcpServerId: string) => {
+    return api.get(`/mcp-servers/meta/${mcpServerId}`);
+  },
+  // 获取 endpoint 列表
+  listEndpoints: (mcpServerId: string) => {
+    return api.get(`/mcp-servers/endpoints`, { params: { mcpServerId } });
+  },
+  // 获取产品下所有 MCP 元信息
+  listMetaByProduct: (productId: string) => {
+    return api.get(`/mcp-servers/meta`, { params: { productId } });
+  },
+  // 市场列表
+  listPublished: (params?: { page?: number; size?: number }) => {
+    return api.get(`/mcp-servers/published`, { params });
+  },
+  // 刷新工具列表
+  refreshTools: (mcpServerId: string) => {
+    return api.post(`/mcp-servers/meta/${mcpServerId}/refresh-tools`, {}, { timeout: 120000 });
+  },
+  // 保存 endpoint
+  saveEndpoint: (data: {
+    mcpServerId: string;
+    endpointUrl: string;
+    hostingType: string;
+    protocol: string;
+    userId?: string;
+    hostingInstanceId?: string;
+    hostingIdentifier?: string;
+  }) => {
+    return api.post(`/mcp-servers/endpoints`, data);
+  },
+  // 保存 MCP 元信息（创建/更新）
+  saveMeta: (data: {
+    productId: string;
+    mcpName: string;
+    displayName: string;
+    description?: string;
+    repoUrl?: string;
+    sourceType?: string;
+    origin?: string;
+    gatewayId?: string;
+    nacosId?: string;
+    refConfig?: string;
+    tags?: string;
+    icon?: string;
+    protocolType: string;
+    connectionConfig: string;
+    extraParams?: string;
+    serviceIntro?: string;
+    visibility?: string;
+    publishStatus?: string;
+    toolsConfig?: string;
+    sandboxRequired?: boolean;
+    sandboxId?: string;
+    transportType?: string;
+    authType?: string;
+    paramValues?: string;
+    namespace?: string;
+    resourceSpec?: string;
+  }) => {
+    return api.post(`/mcp-servers/meta`, data, { timeout: 120000 });
+  },
+  // 更新服务介绍
+  updateServiceIntro: (mcpServerId: string, serviceIntro: string) => {
+    return api.put(`/mcp-servers/meta/${mcpServerId}/service-intro`, { serviceIntro });
+  },
+  // 更新工具配置（手动编辑）
+  updateToolsConfig: (mcpServerId: string, toolsConfig: string) => {
+    return api.put(`/mcp-servers/meta/${mcpServerId}/tools-config`, toolsConfig, {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  },
+};
+
+// Sandbox 实例相关 API
+export const sandboxApi = {
+  // 删除沙箱实例
+  deleteSandbox: (sandboxId: string) => {
+    return api.delete(`/sandboxes/${sandboxId}`);
+  },
+  // 获取集群信息
+  fetchClusterInfo: (kubeConfig: string) => {
+    return api.post(`/sandboxes/cluster-info`, { kubeConfig });
+  },
+  // 查询沙箱上的活跃 MCP 部署数量
+  getActiveDeployments: (sandboxId: string) => {
+    return api.get(`/sandboxes/${sandboxId}/active-deployments`);
+  },
+  // 获取所有运行中的沙箱实例（部署用，不按 adminId 过滤）
+  getActiveSandboxes: () => {
+    return api.get(`/sandboxes/active`);
+  },
+  // 获取沙箱实例列表
+  getSandboxes: (params?: { sandboxType?: string; page?: number; size?: number }) => {
+    return api.get(`/sandboxes`, { params });
+  },
+  // 手动触发健康检查
+  healthCheck: (sandboxId: string) => {
+    return api.post(`/sandboxes/${sandboxId}/health-check`);
+  },
+  // 导入沙箱实例
+  importSandbox: (data: {
+    sandboxName: string;
+    sandboxType: string;
+    kubeConfig: string;
+    description?: string;
+  }) => {
+    return api.post(`/sandboxes`, data);
+  },
+  // 获取沙箱集群的 Namespace 列表
+  listNamespaces: (sandboxId: string) => {
+    return api.get(`/sandboxes/${sandboxId}/namespaces`);
+  },
+  // 更新沙箱实例
+  updateSandbox: (
+    sandboxId: string,
+    data: { sandboxName?: string; kubeConfig?: string; description?: string },
+  ) => {
+    return api.put(`/sandboxes/${sandboxId}`, data);
+  },
+};
+
+// API Definition 相关 API
+export const apiDefinitionApi = {
+  createApiDefinition: (data: {
+    name: string;
+    description?: string;
+    type: 'MCP_SERVER';
+    relatedProductId?: string;
+    version?: string;
+    spec: Record<string, unknown>;
+    meta?: Record<string, unknown>;
+    policies?: unknown[];
+  }) => {
+    return api.post('/api-definitions', data);
+  },
+  deleteApiDefinition: (apiDefinitionId: string) => {
+    return api.delete(`/api-definitions/${apiDefinitionId}`);
+  },
+  getApiDefinition: (apiDefinitionId: string) => {
+    return api.get(`/api-definitions/${apiDefinitionId}`);
+  },
+  listApiDefinitions: (params?: {
+    type?: string;
+    status?: string;
+    keyword?: string;
+    page?: number;
+    size?: number;
+  }) => {
+    return api.get('/api-definitions', { params });
+  },
+  updateApiDefinition: (
+    apiDefinitionId: string,
+    data: {
+      name?: string;
+      description?: string;
+      status?: string;
+      version?: string;
+      spec?: Record<string, unknown>;
+      policies?: unknown[];
+    },
+  ) => {
+    return api.put(`/api-definitions/${apiDefinitionId}`, data);
+  },
+};
+
+// External vendor APIs
+export const mcpVendorApi = {
+  // List MCP servers from an external vendor
+  listRemoteMcpItems: (params: {
+    vendorType: string;
+    keyword?: string;
+    page?: number;
+    size?: number;
+  }) => {
+    const { vendorType, ...query } = params;
+    return api.get(`/external-vendors/${vendorType}/mcp-servers`, { params: query });
+  },
+};

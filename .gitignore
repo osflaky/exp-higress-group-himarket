@@ -1,0 +1,77 @@
+target/
+!.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+### jqwik ###
+.jqwik-database
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+
+### Eclipse ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+build/
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+### VS Code ###
+.vscode/
+
+### Mac OS ###
+.DS_Store
+
+/front-auth-app
+
+package-lock.json
+
+### Node modules ###
+node_modules/
+
+.clinerules/
+
+# Local / deploy scripts (do not commit)
+.env
+push-himarket.sh
+
+/workspace/
+/workspaces/
+
+### Local docs ###
+/docs/acp
+.app.pid
+
+### OpenSandbox (local clone, not committed) ###
+/OpenSandbox/
+
+### Reference projects (local clones/forks, not committed) ###
+/reference-projects/
+
+### Kiro (AWS Kira AI coding agent) ###
+.kiro/
+
+### Qoder repo wiki ###
+.qoder/repowiki/
+
+### Docker deploy data (should live outside project) ###
+deploy/docker/data/
+deploy/docker/standalone-logs/
+
+# TypeScript 编译缓存
+*.tsbuildinfo

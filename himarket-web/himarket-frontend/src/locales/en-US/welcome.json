@@ -1,0 +1,16 @@
+{
+  "chat": {
+    "subtitle": "Choose a model and begin a natural, continuous conversation",
+    "cta": "Sign in to start chatting",
+    "placeholder": "Sign in to send a message to a model...",
+    "loginHint": "Sign in to choose models and use MCP tools"
+  },
+  "coding": {
+    "subtitle": "Describe a goal and let the Agent build, run, and refine it in a sandbox",
+    "cta": "Sign in to start coding",
+    "placeholder": "Sign in and describe what you want to build...",
+    "loginHint": "Sign in to choose models, Skills, and MCP tools",
+    "workspace": "Sandbox workspace"
+  },
+  "register": "Create an account"
+}

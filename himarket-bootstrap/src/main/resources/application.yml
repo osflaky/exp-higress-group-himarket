@@ -1,0 +1,112 @@
+spring:
+  datasource:
+    url: jdbc:mariadb://${db.host}:${db.port}/${db.name}?createDatabaseIfNotExist=true&allowPublicKeyRetrieval=true&useSSL=false&serverTimezone=UTC
+    username: ${db.username}
+    password: ${db.password}
+    driver-class-name: org.mariadb.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: none
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+  servlet:
+    multipart:
+      max-file-size: 30MB
+      max-request-size: 100MB
+
+db:
+   host: ${DB_HOST:localhost}
+   port: ${DB_PORT:3306}
+   name: ${DB_NAME:himarket}
+   username: ${DB_USERNAME:root}
+   password: ${DB_PASSWORD:12345678}
+
+# Encryptor
+encryption:
+  root-key: portalmanagement
+
+springdoc:
+  api-docs:
+    enabled: true
+    path: /portal/v3/api-docs
+  swagger-ui:
+    path: /portal/swagger-ui.html
+    disable-swagger-default-url: true
+  packages-to-scan: com.alibaba.himarket.controller
+
+jwt:
+  secret: ${JWT_SECRET:YourJWTSecret}
+  expiration: 7d
+
+acp:
+  terminal-enabled: ${ACP_TERMINAL_ENABLED:false}
+  default-provider: ${ACP_DEFAULT_PROVIDER:qwen-code}
+  default-runtime: ${ACP_DEFAULT_RUNTIME:remote}
+  remote:
+    host: ${ACP_REMOTE_HOST:sandbox-shared}
+    port: ${ACP_REMOTE_PORT:8080}
+  providers:
+    qwen-code:
+      display-name: Qwen Code
+      command: ${ACP_CLI_COMMAND_QWEN:qwen}
+      args: ${ACP_CLI_ARGS_QWEN:--acp}
+      compatible-runtimes:
+        - REMOTE
+      supports-custom-model: true
+      supports-mcp: true
+      supports-skill: true
+    qodercli:
+      display-name: Qoder CLI
+      command: ${ACP_CLI_COMMAND_QODERCLI:qodercli}
+      args: ${ACP_CLI_ARGS_QODERCLI:--acp}
+      compatible-runtimes:
+        - REMOTE
+      auth-options: default,personal_access_token
+      auth-env-var: QODER_PERSONAL_ACCESS_TOKEN
+    claude-code:
+      display-name: Claude Code
+      command: ${ACP_CLI_COMMAND_CLAUDE:claude-agent-acp}
+      args: ${ACP_CLI_ARGS_CLAUDE:}
+      compatible-runtimes:
+        - REMOTE
+      auth-env-var: ANTHROPIC_API_KEY
+      supports-custom-model: true
+      supports-mcp: true
+      supports-skill: true
+    opencode:
+      display-name: OpenCode
+      command: ${ACP_CLI_COMMAND_OPENCODE:opencode}
+      args: ${ACP_CLI_ARGS_OPENCODE:acp}
+      compatible-runtimes:
+        - REMOTE
+      supports-custom-model: true
+      supports-mcp: true
+      supports-skill: true
+
+open-api:
+  api-key: ${OPEN_API_KEY:}
+
+observability:
+  log-source: ${OBSERVABILITY_LOG_SOURCE:SLS}
+
+sls:
+  # SLS endpoint, required when SLS is enabled.
+  # cn-chengdu.log.aliyuncs.com
+  endpoint: ${SLS_ENDPOINT:}
+  # Authentication type: STS or AK_SK.
+  auth-type: ${SLS_AUTH_TYPE:STS}
+  # Access key credentials, used only when auth-type is AK_SK.
+  access-key-id: ${SLS_ACCESS_KEY_ID:}
+  access-key-secret: ${SLS_ACCESS_KEY_SECRET:}
+  # Default project name.
+  default-project: ${SLS_DEFAULT_PROJECT:apigateway-csb-cop}
+  # Default Logstore name.
+  default-logstore: ${SLS_DEFAULT_LOGSTORE:apig-access-log}
+  # AliyunLogConfig custom resource settings.
+  aliyun-log-config:
+    # Namespace of the custom resource.
+    namespace: ${SLS_ALIYUN_LOG_CONFIG_NAMESPACE:apigateway-system}
+    # Name of the custom resource.
+    cr-name: ${SLS_ALIYUN_LOG_CONFIG_CR_NAME:apigateway-access-log}

@@ -1,0 +1,298 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package com.alibaba.himarket.service.impl;
+
+import com.alibaba.himarket.core.constant.IdpConstants;
+import com.alibaba.himarket.core.exception.BusinessException;
+import com.alibaba.himarket.core.exception.ErrorCode;
+import com.alibaba.himarket.service.IdpService;
+import com.alibaba.himarket.service.gateway.factory.HTTPClientFactory;
+import com.alibaba.himarket.support.common.Strings;
+import com.alibaba.himarket.support.enums.GrantType;
+import com.alibaba.himarket.support.enums.PublicKeyFormat;
+import com.alibaba.himarket.support.portal.AuthCodeConfig;
+import com.alibaba.himarket.support.portal.JwtBearerConfig;
+import com.alibaba.himarket.support.portal.OAuth2Config;
+import com.alibaba.himarket.support.portal.OidcConfig;
+import com.alibaba.himarket.support.portal.PublicKeyConfig;
+import com.alibaba.himarket.utils.JsonUtil;
+import com.fasterxml.jackson.databind.JsonNode;
+import java.math.BigInteger;
+import java.security.KeyFactory;
+import java.security.PublicKey;
+import java.security.spec.RSAPublicKeySpec;
+import java.security.spec.X509EncodedKeySpec;
+import java.util.Base64;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpMethod;
+import org.springframework.stereotype.Service;
+import org.springframework.util.CollectionUtils;
+import org.springframework.web.client.RestTemplate;
+
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class IdpServiceImpl implements IdpService {
+
+    private final RestTemplate restTemplate = HTTPClientFactory.createRestTemplate();
+
+    @Override
+    public void validateOidcConfigs(List<OidcConfig> oidcConfigs) {
+        if (CollectionUtils.isEmpty(oidcConfigs)) {
+            return;
+        }
+
+        // Provider must be unique
+        Set<String> providers =
+                oidcConfigs.stream()
+                        .map(OidcConfig::getProvider)
+                        .filter(Strings::isNotBlank)
+                        .collect(Collectors.toSet());
+        if (providers.size() != oidcConfigs.size()) {
+            throw new BusinessException(
+                    ErrorCode.CONFLICT, "Empty or duplicate provider in OIDC config");
+        }
+
+        for (OidcConfig config : oidcConfigs) {
+            AuthCodeConfig authConfig = config.getAuthCodeConfig();
+            if (authConfig == null) {
+                throw new BusinessException(
+                        ErrorCode.INVALID_PARAMETER,
+                        "OIDC config " + config.getProvider() + " missing auth code config");
+            }
+
+            // Basic parameters
+            if (Strings.isBlank(authConfig.getClientId())
+                    || Strings.isBlank(authConfig.getClientSecret())
+                    || Strings.isBlank(authConfig.getScopes())) {
+                throw new BusinessException(
+                        ErrorCode.INVALID_PARAMETER,
+                        "OIDC config "
+                                + config.getProvider()
+                                + " missing required params: Client ID, Client Secret or Scopes");
+            }
+
+            // Endpoint configuration
+            if (Strings.isNotBlank(authConfig.getIssuer())) {
+                discoverAndSetEndpoints(config.getProvider(), authConfig);
+            } else {
+                if (Strings.isBlank(authConfig.getAuthorizationEndpoint())
+                        || Strings.isBlank(authConfig.getTokenEndpoint())
+                        || Strings.isBlank(authConfig.getUserInfoEndpoint())) {
+                    throw new BusinessException(
+                            ErrorCode.INVALID_PARAMETER,
+                            "OIDC config "
+                                    + config.getProvider()
+                                    + " missing required endpoint config");
+                }
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void discoverAndSetEndpoints(String provider, AuthCodeConfig config) {
+        String discoveryUrl =
+                config.getIssuer().replaceAll("/$", "") + "/.well-known/openid-configuration";
+        try {
+            Map<String, Object> discovery =
+                    restTemplate.exchange(discoveryUrl, HttpMethod.GET, null, Map.class).getBody();
+
+            // Validate and set endpoints
+            String authEndpoint =
+                    getRequiredEndpoint(discovery, IdpConstants.AUTHORIZATION_ENDPOINT);
+            String tokenEndpoint = getRequiredEndpoint(discovery, IdpConstants.TOKEN_ENDPOINT);
+            String userInfoEndpoint =
+                    getRequiredEndpoint(discovery, IdpConstants.USERINFO_ENDPOINT);
+
+            config.setAuthorizationEndpoint(authEndpoint);
+            config.setTokenEndpoint(tokenEndpoint);
+            config.setUserInfoEndpoint(userInfoEndpoint);
+        } catch (Exception e) {
+            log.error(
+                    "Failed to discover OIDC endpoints, discoveryUrl={}, errorMessage={}",
+                    discoveryUrl,
+                    e.getMessage(),
+                    e);
+            throw new BusinessException(
+                    ErrorCode.INVALID_PARAMETER,
+                    "OIDC config " + provider + " issuer is invalid or unreachable");
+        }
+    }
+
+    private String getRequiredEndpoint(Map<String, Object> discovery, String name) {
+        Object endpoint = discovery.get(name);
+        if (endpoint == null || Strings.isBlank(endpoint.toString())) {
+            throw new BusinessException(
+                    ErrorCode.INVALID_PARAMETER,
+                    "Missing endpoint in OIDC discovery config: " + name);
+        }
+        return endpoint.toString();
+    }
+
+    @Override
+    public void validateOAuth2Configs(List<OAuth2Config> oauth2Configs) {
+        if (CollectionUtils.isEmpty(oauth2Configs)) {
+            return;
+        }
+
+        // Provider must be unique
+        Set<String> providers =
+                oauth2Configs.stream()
+                        .map(OAuth2Config::getProvider)
+                        .filter(Strings::isNotBlank)
+                        .collect(Collectors.toSet());
+        if (providers.size() != oauth2Configs.size()) {
+            throw new BusinessException(
+                    ErrorCode.CONFLICT, "Empty or duplicate provider in OAuth2 config");
+        }
+
+        for (OAuth2Config config : oauth2Configs) {
+            if (GrantType.JWT_BEARER.equals(config.getGrantType())) {
+                validateJwtBearerConfig(config);
+            }
+        }
+    }
+
+    private void validateJwtBearerConfig(OAuth2Config config) {
+        JwtBearerConfig jwtBearerConfig = config.getJwtBearerConfig();
+        if (jwtBearerConfig == null) {
+            throw new BusinessException(
+                    ErrorCode.INVALID_PARAMETER,
+                    "OAuth2 config "
+                            + config.getProvider()
+                            + " uses JWT bearer but missing JWT bearer config");
+        }
+
+        List<PublicKeyConfig> publicKeys = jwtBearerConfig.getPublicKeys();
+        if (CollectionUtils.isEmpty(publicKeys)) {
+            throw new BusinessException(
+                    ErrorCode.INVALID_PARAMETER,
+                    "OAuth2 config " + config.getProvider() + " missing public key config");
+        }
+
+        if (publicKeys.stream()
+                        .map(
+                                key -> {
+                                    // Load public key to validate
+                                    loadPublicKey(key.getFormat(), key.getValue());
+                                    return key.getKid();
+                                })
+                        .collect(Collectors.toSet())
+                        .size()
+                != publicKeys.size()) {
+            throw new BusinessException(
+                    ErrorCode.CONFLICT,
+                    "OAuth2 config " + config.getProvider() + " has duplicate public key IDs");
+        }
+    }
+
+    @Override
+    public PublicKey loadPublicKey(PublicKeyFormat format, String publicKey) {
+        switch (format) {
+            case PEM:
+                return loadPublicKeyFromPem(publicKey);
+            case JWK:
+                return loadPublicKeyFromJwk(publicKey);
+            default:
+                throw new BusinessException(
+                        ErrorCode.INVALID_PARAMETER, "Unsupported public key format");
+        }
+    }
+
+    private PublicKey loadPublicKeyFromPem(String pemContent) {
+        // Clean PEM format markers and whitespace
+        String publicKeyPEM =
+                pemContent
+                        .replace("-----BEGIN PUBLIC KEY-----", "")
+                        .replace("-----END PUBLIC KEY-----", "")
+                        .replace("-----BEGIN RSA PUBLIC KEY-----", "")
+                        .replace("-----END RSA PUBLIC KEY-----", "")
+                        .replaceAll("\\s", "");
+
+        if (Strings.isBlank(publicKeyPEM)) {
+            throw new IllegalArgumentException("PEM content is empty");
+        }
+
+        try {
+            // Base64 decode
+            byte[] decoded = Base64.getDecoder().decode(publicKeyPEM);
+
+            // Public key object
+            X509EncodedKeySpec spec = new X509EncodedKeySpec(decoded);
+            KeyFactory keyFactory = KeyFactory.getInstance("RSA");
+            return keyFactory.generatePublic(spec);
+        } catch (Exception e) {
+            log.error("Failed to parse PEM public key, errorMessage={}", e.getMessage(), e);
+            throw new BusinessException(
+                    ErrorCode.INTERNAL_ERROR, "Failed to parse PEM public key: " + e.getMessage());
+        }
+    }
+
+    private PublicKey loadPublicKeyFromJwk(String jwkContent) {
+        JsonNode jwk = JsonUtil.readTree(jwkContent);
+
+        // Validate required fields
+        String kty = getRequiredField(jwk, "kty");
+        if (!"RSA".equals(kty)) {
+            throw new IllegalArgumentException("Only RSA type JWK is supported");
+        }
+
+        return loadRSAPublicKeyFromJwk(jwk);
+    }
+
+    private PublicKey loadRSAPublicKeyFromJwk(JsonNode jwk) {
+        // Get required RSA parameters
+        String nStr = getRequiredField(jwk, "n");
+        String eStr = getRequiredField(jwk, "e");
+
+        try {
+            // Base64 decode parameters
+            byte[] nBytes = Base64.getUrlDecoder().decode(nStr);
+            byte[] eBytes = Base64.getUrlDecoder().decode(eStr);
+
+            // Build RSA public key
+            BigInteger modulus = new BigInteger(1, nBytes);
+            BigInteger exponent = new BigInteger(1, eBytes);
+
+            RSAPublicKeySpec spec = new RSAPublicKeySpec(modulus, exponent);
+            KeyFactory keyFactory = KeyFactory.getInstance("RSA");
+            return keyFactory.generatePublic(spec);
+        } catch (Exception e) {
+            log.error("Failed to parse JWK RSA parameters, errorMessage={}", e.getMessage(), e);
+            throw new BusinessException(
+                    ErrorCode.INTERNAL_ERROR,
+                    "Failed to parse JWK RSA parameters: " + e.getMessage());
+        }
+    }
+
+    private String getRequiredField(JsonNode jwk, String fieldName) {
+        String value = jwk.path(fieldName).asText();
+        if (Strings.isBlank(value)) {
+            throw new BusinessException(
+                    ErrorCode.INVALID_REQUEST, "Missing JWK field: " + fieldName);
+        }
+        return value;
+    }
+}

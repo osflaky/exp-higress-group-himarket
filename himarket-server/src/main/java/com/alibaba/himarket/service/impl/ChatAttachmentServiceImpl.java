@@ -1,0 +1,200 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package com.alibaba.himarket.service.impl;
+
+import com.alibaba.himarket.core.exception.BusinessException;
+import com.alibaba.himarket.core.exception.ErrorCode;
+import com.alibaba.himarket.core.security.ContextHolder;
+import com.alibaba.himarket.core.utils.FileUploadValidator;
+import com.alibaba.himarket.core.utils.IdGenerator;
+import com.alibaba.himarket.dto.result.chat.ChatAttachmentDetailResult;
+import com.alibaba.himarket.dto.result.chat.ChatAttachmentResult;
+import com.alibaba.himarket.entity.ChatAttachment;
+import com.alibaba.himarket.repository.ChatAttachmentRepository;
+import com.alibaba.himarket.service.ChatAttachmentService;
+import com.alibaba.himarket.support.enums.ChatAttachmentType;
+import java.time.LocalDateTime;
+import java.util.Base64;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.multipart.MultipartFile;
+
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class ChatAttachmentServiceImpl implements ChatAttachmentService {
+
+    private static final int MAX_GENERATED_IMAGE_SIZE = 16 * 1024 * 1024 - 1;
+
+    private static final int ATTACHMENT_RETENTION_DAYS = 90;
+
+    private final ContextHolder contextHolder;
+
+    private final ChatAttachmentRepository chatAttachmentRepository;
+
+    @Override
+    @Transactional
+    public ChatAttachmentResult uploadAttachment(MultipartFile file) {
+        if (file == null || file.isEmpty()) {
+            throw new BusinessException(ErrorCode.INVALID_REQUEST, "File cannot be empty");
+        }
+
+        // Validate file upload security
+        FileUploadValidator.validate(file);
+
+        // Determine attachment type from MIME type
+        String mimeType = file.getContentType();
+        ChatAttachmentType type = determineAttachmentType(mimeType);
+
+        try {
+            // Build attachment entity
+            ChatAttachment attachment =
+                    ChatAttachment.builder()
+                            .attachmentId(IdGenerator.genChatAttachmentId())
+                            .userId(contextHolder.getUser())
+                            .name(FileUploadValidator.sanitizeFilename(file.getOriginalFilename()))
+                            .type(type)
+                            .mimeType(mimeType)
+                            .size(file.getSize())
+                            .data(file.getBytes())
+                            .build();
+
+            // Save to database
+            ChatAttachment chatAttachment = chatAttachmentRepository.save(attachment);
+
+            return new ChatAttachmentResult().convertFrom(chatAttachment);
+        } catch (Exception e) {
+            log.error(
+                    "Failed to upload attachment, fileName={}, errorMessage={}",
+                    file.getOriginalFilename(),
+                    e.getMessage(),
+                    e);
+            throw new BusinessException(
+                    ErrorCode.INTERNAL_ERROR, "Failed to upload attachment: " + e.getMessage());
+        }
+    }
+
+    @Override
+    @Transactional
+    public ChatAttachmentResult saveGeneratedImage(String userId, String mimeType, byte[] data) {
+        if (userId == null || userId.isBlank() || data == null || data.length == 0) {
+            throw new BusinessException(
+                    ErrorCode.INVALID_REQUEST, "Generated image data cannot be empty");
+        }
+        if (data.length > MAX_GENERATED_IMAGE_SIZE) {
+            throw new BusinessException(
+                    ErrorCode.INVALID_REQUEST, "Generated image exceeds the storage limit");
+        }
+        if (mimeType == null) {
+            throw new BusinessException(
+                    ErrorCode.INVALID_REQUEST, "Generated image type cannot be empty");
+        }
+
+        String extension =
+                switch (mimeType) {
+                    case "image/png" -> "png";
+                    case "image/jpeg" -> "jpg";
+                    case "image/webp" -> "webp";
+                    default ->
+                            throw new BusinessException(
+                                    ErrorCode.INVALID_REQUEST,
+                                    "Unsupported generated image type: " + mimeType);
+                };
+        String attachmentId = IdGenerator.genChatAttachmentId();
+        ChatAttachment attachment =
+                ChatAttachment.builder()
+                        .attachmentId(attachmentId)
+                        .userId(userId)
+                        .name("generated-image-" + attachmentId + "." + extension)
+                        .type(ChatAttachmentType.IMAGE)
+                        .mimeType("image/" + ("jpg".equals(extension) ? "jpeg" : extension))
+                        .size((long) data.length)
+                        .data(data)
+                        .build();
+        return new ChatAttachmentResult().convertFrom(chatAttachmentRepository.save(attachment));
+    }
+
+    /**
+     * Determine attachment type from MIME type
+     *
+     * @param mimeType MIME type
+     * @return Attachment type
+     */
+    private ChatAttachmentType determineAttachmentType(String mimeType) {
+        if (mimeType == null) {
+            return ChatAttachmentType.TEXT;
+        }
+
+        if (mimeType.startsWith("image/")) {
+            return ChatAttachmentType.IMAGE;
+        } else if (mimeType.startsWith("video/")) {
+            return ChatAttachmentType.VIDEO;
+        } else if (mimeType.startsWith("audio/")) {
+            return ChatAttachmentType.AUDIO;
+        } else {
+            return ChatAttachmentType.TEXT;
+        }
+    }
+
+    @Override
+    public ChatAttachmentDetailResult getAttachmentDetail(String attachmentId) {
+        ChatAttachment attachment = findAttachment(attachmentId);
+
+        // Encode data to Base64
+        String base64Data = Base64.getEncoder().encodeToString(attachment.getData());
+
+        log.debug(
+                "Retrieved attachment detail, attachmentId={}, size={}",
+                attachmentId,
+                attachment.getSize());
+
+        return ChatAttachmentDetailResult.builder()
+                .attachmentId(attachment.getAttachmentId())
+                .name(attachment.getName())
+                .type(attachment.getType())
+                .mimeType(attachment.getMimeType())
+                .size(attachment.getSize())
+                .data(base64Data)
+                .build();
+    }
+
+    @Override
+    @Transactional
+    public int cleanupExpiredAttachments() {
+        LocalDateTime expiredBefore = LocalDateTime.now().minusDays(ATTACHMENT_RETENTION_DAYS);
+        int deletedCount = chatAttachmentRepository.deleteExpiredAttachments(expiredBefore);
+        log.debug(
+                "Cleaned expired chat attachments, expiredBefore={}, deletedCount={}",
+                expiredBefore,
+                deletedCount);
+        return deletedCount;
+    }
+
+    private ChatAttachment findAttachment(String attachmentId) {
+        return chatAttachmentRepository
+                .findByAttachmentIdAndUserId(attachmentId, contextHolder.getUser())
+                .orElseThrow(
+                        () ->
+                                new BusinessException(
+                                        ErrorCode.NOT_FOUND, "Chat attachment", attachmentId));
+    }
+}

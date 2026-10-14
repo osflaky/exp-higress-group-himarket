@@ -1,0 +1,1 @@
+../../../.agent-skills/frontend-coding-standards/SKILL.md

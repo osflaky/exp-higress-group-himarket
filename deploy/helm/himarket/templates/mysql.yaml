@@ -1,0 +1,103 @@
+# MySQL Headless Service: 为 StatefulSet 提供稳定的网络域
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-headless-svc
+spec:
+  ports:
+    - port: 3306
+      name: mysql
+  clusterIP: None
+  selector:
+    app: mysql
+
+---
+# MySQL External Service: 暴露数据库给外部访问（可选）
+{{- if .Values.mysql.service.external.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-external-svc
+spec:
+  type: {{ .Values.mysql.service.external.type }}
+  ports:
+    - port: 3306
+      targetPort: 3306
+      protocol: TCP
+  selector:
+    app: mysql
+{{- end }}
+
+---
+# MySQL StatefulSet: 部署 MySQL 应用
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  labels:
+    app: mysql
+spec:
+  replicas: {{ .Values.mysql.replicaCount }}
+  selector:
+    matchLabels:
+      app: mysql
+  serviceName: "mysql-headless-svc"
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      serviceAccountName: {{ include "himarket.serviceAccountName" . }}
+      containers:
+        - name: mysql
+          image: "{{ .Values.hub }}/{{ .Values.mysql.image.repository }}:{{ .Values.mysql.image.tag }}"
+          imagePullPolicy: {{ .Values.mysql.image.pullPolicy }}
+          ports:
+            - containerPort: 3306
+              name: mysql
+          envFrom:
+            - secretRef:
+                name: mysql-secret
+          volumeMounts:
+            - name: mysql-data
+              mountPath: /var/lib/mysql
+          {{- with .Values.mysql.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # 健康检查（通过环境变量引用密码，避免硬编码）
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - mysqladmin ping -h localhost -u"$MYSQL_USER" -p"$MYSQL_PASSWORD"
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - mysql -h localhost -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" -e "SELECT 1"
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            timeoutSeconds: 5
+
+  volumeClaimTemplates:
+    - metadata:
+        name: mysql-data
+      spec:
+        accessModes: 
+          - {{ .Values.mysql.persistence.accessMode }}
+        resources:
+          requests:
+            storage: {{ .Values.mysql.persistence.size }}
+        {{- if .Values.mysql.persistence.storageClass }}
+        {{- if (eq "-" .Values.mysql.persistence.storageClass) }}
+        storageClassName: ""
+        {{- else }}
+        storageClassName: {{ .Values.mysql.persistence.storageClass | quote }}
+        {{- end }}
+        {{- end }}

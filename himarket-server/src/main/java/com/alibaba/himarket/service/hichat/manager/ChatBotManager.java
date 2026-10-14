@@ -1,0 +1,580 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package com.alibaba.himarket.service.hichat.manager;
+
+import com.alibaba.himarket.core.event.McpClientRemovedEvent;
+import com.alibaba.himarket.core.utils.CacheUtil;
+import com.alibaba.himarket.dto.result.product.ProductResult;
+import com.alibaba.himarket.service.hichat.memory.ChatMemoryAgentStateStore;
+import com.alibaba.himarket.service.hichat.support.ChatBot;
+import com.alibaba.himarket.service.hichat.support.LlmChatRequest;
+import com.alibaba.himarket.service.hichat.support.ToolMeta;
+import com.alibaba.himarket.support.chat.mcp.McpTransportConfig;
+import com.alibaba.himarket.support.common.Strings;
+import com.github.benmanes.caffeine.cache.Cache;
+import io.agentscope.core.model.Model;
+import io.agentscope.core.tool.ToolGroup;
+import io.agentscope.core.tool.Toolkit;
+import io.agentscope.core.tool.mcp.McpClientWrapper;
+import io.agentscope.core.tool.mcp.McpTool;
+import io.agentscope.harness.agent.HarnessAgent;
+import io.agentscope.harness.agent.memory.MemoryConfig;
+import io.agentscope.harness.agent.memory.compaction.CompactionConfig;
+import io.modelcontextprotocol.spec.McpSchema;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.event.EventListener;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Component;
+import org.springframework.util.CollectionUtils;
+import org.springframework.util.DigestUtils;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class ChatBotManager {
+
+    private static final int COMPACTION_TRIGGER_MESSAGES = 40;
+    private static final int COMPACTION_KEEP_MESSAGES = 20;
+
+    private final ToolManager toolManager;
+
+    private final ChatMemoryAgentStateStore chatMemoryAgentStateStore;
+
+    private final Cache<String, ChatBot> chatBotCache = CacheUtil.newLRUCache(10 * 60);
+
+    /**
+     * A reverse lookup map tracking dependencies between tools and ChatBots.
+     *
+     * <p>Structure:
+     * - Key: Tool key "tool:{md5}" (md5 = hash(url+headers+params))
+     * - Value: Set of dependent ChatBot keys
+     *
+     * <p>Used for cascade invalidation when a tool is removed from cache.
+     */
+    private final Map<String, Set<String>> toolDependencies = new ConcurrentHashMap<>();
+
+    /**
+     * Get existing ChatBot or create a new one based on request
+     *
+     * @param request chat request containing session and configuration info
+     * @param model   LLM model to be used
+     * @return ChatBot instance or null if creation fails
+     */
+    public ChatBot getOrCreateChatBot(LlmChatRequest request, Model model) {
+        String sessionId = request.getSessionId();
+        String productId = request.getProduct().getProductId();
+
+        if (Strings.isBlank(sessionId) || Strings.isBlank(productId)) {
+            log.error("Invalid request: sessionId and productId required");
+            return null;
+        }
+
+        String cacheKey = buildCacheKey(request);
+
+        // Check if cached ChatBot exists and is still valid
+        ChatBot cachedBot = chatBotCache.getIfPresent(cacheKey);
+        if (cachedBot != null) {
+            if (cachedBot.isValid()) {
+                log.debug("Reused ChatBot from cache, degraded={}", cachedBot.isDegraded());
+                return cachedBot;
+            } else {
+                // Invalid (degraded TTL exceeded), remove from cache and create a new one
+                chatBotCache.invalidate(cacheKey);
+                log.info("ChatBot invalid (degraded TTL exceeded), removed from cache");
+            }
+        }
+
+        // Create a new ChatBot
+        try {
+            ChatBot chatBot = createChatBot(request, model);
+            if (chatBot != null) {
+                chatBotCache.put(cacheKey, chatBot);
+
+                // Register mapping relationship
+                int mcpCount = registerToolDependencies(cacheKey, request.getMcpConfigs());
+
+                log.info(
+                        "Created ChatBot, sessionId={}, degraded={}, mcpCount={}",
+                        sessionId,
+                        chatBot.isDegraded(),
+                        mcpCount);
+            }
+            return chatBot;
+        } catch (Exception e) {
+            log.error(
+                    "Failed to create ChatBot, sessionId={}, productId={}, errorMessage={}",
+                    sessionId,
+                    productId,
+                    e.getMessage(),
+                    e);
+            return null;
+        }
+    }
+
+    /**
+     * Create a new ChatBot instance with required components
+     *
+     * @param request chat request containing configuration
+     * @param model   LLM model to be used
+     * @return configured ChatBot instance
+     */
+    private ChatBot createChatBot(LlmChatRequest request, Model model) {
+        ProductResult product = request.getProduct();
+        long startTime = System.currentTimeMillis();
+
+        // Initialize and register mcp tools
+        List<McpTransportConfig> mcpConfigs = request.getMcpConfigs();
+        int expectedMcpCount = CollectionUtils.isEmpty(mcpConfigs) ? 0 : mcpConfigs.size();
+
+        List<McpClientWrapper> mcpClients = loadMcpClients(request);
+        Toolkit toolkit = new Toolkit();
+        long actualSuccessCount = registerMcpTools(toolkit, mcpClients);
+
+        // Build tool metadata mapping
+        Map<String, ToolMeta> toolMetas = buildToolMetas(toolkit);
+        List<String> activeToolGroups = List.copyOf(toolkit.getActiveGroups());
+
+        String systemPrompt = buildSystemPrompt(product.getName());
+
+        HarnessAgent agent =
+                HarnessAgent.builder()
+                        .agentId("hichat-" + product.getProductId())
+                        .name(product.getName())
+                        .sysPrompt(systemPrompt)
+                        .model(model)
+                        .toolkit(toolkit)
+                        .stateStore(chatMemoryAgentStateStore)
+                        .defaultSessionId(request.getSessionId())
+                        .maxIters(10)
+                        .enableAgentTracingLog(false)
+                        .disableWorkspaceContext()
+                        .disableAtPathExpansion()
+                        .disableFilesystemTools()
+                        .disableShellTool()
+                        .disableSubagents()
+                        .disableDynamicSubagents()
+                        .disableDynamicSkills()
+                        .disableDefaultWorkspaceSkills()
+                        .disableMemoryTools()
+                        .disableMemoryHooks()
+                        .disableToolsConfig()
+                        .disableToolResultEviction()
+                        .memory(
+                                MemoryConfig.builder()
+                                        .flushTrigger(MemoryConfig.FlushTrigger.never())
+                                        .build())
+                        .compaction(buildCompactionConfig())
+                        .build();
+
+        // Determine if ChatBot is in degraded mode
+        boolean degraded = actualSuccessCount < expectedMcpCount;
+
+        long totalTime = System.currentTimeMillis() - startTime;
+        log.info(
+                "ChatBot created, sessionId={}, succeededMcpCount={}, expectedMcpCount={},"
+                        + " toolGroupCount={}, toolCount={}, degraded={}, elapsedMillis={}",
+                request.getSessionId(),
+                actualSuccessCount,
+                expectedMcpCount,
+                activeToolGroups.size(),
+                toolMetas.size(),
+                degraded,
+                totalTime);
+
+        return ChatBot.builder()
+                .agent(agent)
+                .toolMetas(toolMetas)
+                .activeToolGroups(activeToolGroups)
+                .degraded(degraded)
+                .build();
+    }
+
+    private static CompactionConfig buildCompactionConfig() {
+        return CompactionConfig.builder()
+                .triggerMessages(COMPACTION_TRIGGER_MESSAGES)
+                .keepMessages(COMPACTION_KEEP_MESSAGES)
+                .keepTokens(0)
+                .flushBeforeCompact(false)
+                .offloadBeforeCompact(false)
+                .truncateArgs(CompactionConfig.TruncateArgsConfig.builder().build())
+                .build();
+    }
+
+    /**
+     * Load MCP clients from configuration
+     *
+     * @param request chat request containing MCP configs
+     * @return list of MCP client wrappers
+     */
+    private List<McpClientWrapper> loadMcpClients(LlmChatRequest request) {
+        List<McpTransportConfig> mcpConfigs = request.getMcpConfigs();
+        if (CollectionUtils.isEmpty(mcpConfigs)) {
+            log.debug("No MCP configs found for chat, chatId={}", request.getChatId());
+            return List.of();
+        }
+
+        List<McpClientWrapper> clients = toolManager.getOrCreateClients(mcpConfigs);
+        if (clients.isEmpty()) {
+            log.warn("No MCP clients available for chat, chatId={}", request.getChatId());
+        }
+        return clients;
+    }
+
+    /**
+     * Register MCP tools to toolkit
+     *
+     * @param toolkit toolkit to register tools
+     * @param clients MCP clients containing tools
+     * @return number of MCP clients that successfully registered tools
+     */
+    private long registerMcpTools(Toolkit toolkit, List<McpClientWrapper> clients) {
+        if (clients.isEmpty()) {
+            return 0;
+        }
+
+        long startTime = System.currentTimeMillis();
+
+        // Process all MCP clients in parallel (max 20 concurrent)
+        Long result =
+                Flux.fromIterable(clients)
+                        .flatMap(
+                                client -> {
+                                    // Try to list and register tools from this client
+                                    return client.listTools()
+                                            .flatMapIterable(tools -> tools)
+                                            .doOnNext(tool -> registerTool(toolkit, client, tool))
+                                            // Success: count this client
+                                            .then(Mono.just(1))
+                                            .doOnError(
+                                                    error ->
+                                                            log.error(
+                                                                    "Failed to list tools from MCP"
+                                                                            + " server,"
+                                                                            + " serverName={},"
+                                                                            + " errorMessage={}",
+                                                                    client.getName(),
+                                                                    error.getMessage(),
+                                                                    error))
+                                            .onErrorResume(error -> Mono.empty());
+                                },
+                                20)
+                        .count()
+                        .defaultIfEmpty(0L)
+                        .block();
+
+        long successCount = result != null ? result : 0;
+        long totalTime = System.currentTimeMillis() - startTime;
+
+        log.info(
+                "MCP tools registered, succeededServerCount={}, totalServerCount={},"
+                        + " elapsedMillis={}",
+                successCount,
+                clients.size(),
+                totalTime);
+
+        return successCount;
+    }
+
+    /**
+     * Build tool metadata from toolkit
+     *
+     * @param toolkit toolkit containing registered tools
+     * @return map from tool name to tool metadata
+     */
+    private Map<String, ToolMeta> buildToolMetas(Toolkit toolkit) {
+        Map<String, ToolMeta> toolMetas = new HashMap<>();
+
+        // Get all active groups (each group represents an MCP server)
+        List<String> activeGroups = toolkit.getActiveGroups();
+
+        for (String groupName : activeGroups) {
+            ToolGroup group = toolkit.getToolGroup(groupName);
+            if (group == null) {
+                log.warn("Tool group not found, groupName={}", groupName);
+                continue;
+            }
+
+            Set<String> tools = group.getTools();
+
+            for (String toolName : tools) {
+                ToolMeta toolMeta =
+                        ToolMeta.builder().mcpServerName(groupName).toolName(toolName).build();
+
+                toolMetas.put(toolName, toolMeta);
+            }
+        }
+
+        return toolMetas;
+    }
+
+    /**
+     * Register single MCP tool to toolkit with groupName
+     *
+     * @param toolkit toolkit to register tool
+     * @param client  MCP client wrapper
+     * @param tool    tool to be registered
+     */
+    private void registerTool(Toolkit toolkit, McpClientWrapper client, McpSchema.Tool tool) {
+        try {
+            // Note: The second parameter of convertMcpSchemaToParameters is presetKeys
+            // (parameters to exclude from schema because they have preset values).
+            // Pass null since we have no preset parameters here.
+            Map<String, Object> parameters =
+                    McpTool.convertMcpSchemaToParameters(tool.inputSchema(), null);
+            Map<String, Object> outputSchema =
+                    tool.outputSchema() != null
+                            ? new ConcurrentHashMap<>(tool.outputSchema())
+                            : null;
+            boolean readOnly =
+                    tool.annotations() != null
+                            && Boolean.TRUE.equals(tool.annotations().readOnlyHint());
+            McpTool mcpTool =
+                    new McpTool(
+                            tool.name(),
+                            tool.description() != null ? tool.description() : "",
+                            parameters,
+                            outputSchema,
+                            client,
+                            null,
+                            client.getName(),
+                            readOnly);
+
+            // Use MCP server name as groupName
+            String groupName = client.getName();
+
+            // Create tool group if not exists
+            if (toolkit.getToolGroup(groupName) == null) {
+                toolkit.createToolGroup(
+                        groupName, String.format("Tools from MCP server: %s", groupName), true);
+            }
+
+            // Register tool with group
+            toolkit.registration().agentTool(mcpTool).group(groupName).apply();
+
+        } catch (Exception e) {
+            log.error(
+                    "Failed to register tool, toolName={}, clientName={}, errorMessage={}",
+                    tool.name(),
+                    client.getName(),
+                    e.getMessage(),
+                    e);
+        }
+    }
+
+    /**
+     * Build system prompt for ChatBot
+     *
+     * @param productName name of the product
+     * @return formatted system prompt
+     */
+    private String buildSystemPrompt(String productName) {
+        return String.format(
+                "You are a helpful AI assistant powered by %s. "
+                        + "You can use various tools to help answer user questions. "
+                        + "Always provide accurate and helpful responses.",
+                productName);
+    }
+
+    /**
+     * Register tool dependencies for cascade invalidation.
+     * Maps MCP tool keys to dependent ChatBot for automatic cleanup when tool is removed.
+     *
+     * @param chatBotCacheKey Cache key of ChatBot to track
+     * @param mcpConfigs List of MCP configs used by ChatBot
+     * @return Number of registered tool dependencies
+     */
+    private int registerToolDependencies(
+            String chatBotCacheKey, List<McpTransportConfig> mcpConfigs) {
+        if (CollectionUtils.isEmpty(mcpConfigs)) {
+            return 0;
+        }
+
+        // Build MCP cache keys
+        List<String> mcpCacheKeys = mcpConfigs.stream().map(toolManager::buildCacheKey).toList();
+
+        // Register mapping
+        for (String mcpCacheKey : mcpCacheKeys) {
+            toolDependencies
+                    .computeIfAbsent(mcpCacheKey, k -> ConcurrentHashMap.newKeySet())
+                    .add(chatBotCacheKey);
+        }
+
+        log.debug(
+                "Registered ChatBot mapping, chatBotCacheKey={}, mcpKeyCount={},"
+                        + " totalMappingCount={}",
+                chatBotCacheKey,
+                mcpCacheKeys.size(),
+                toolDependencies.size());
+
+        return mcpCacheKeys.size();
+    }
+
+    /**
+     * Event listener for MCP client removal.
+     *
+     * <p>Invalidates all ChatBots that depend on the removed MCP client.
+     *
+     * @param event MCP client removed event
+     */
+    @EventListener
+    @Async("taskExecutor")
+    public void onMcpClientRemoved(McpClientRemovedEvent event) {
+        String mcpCacheKey = event.getMcpCacheKey();
+
+        log.info("Received MCP client removed event, cacheKey={}", mcpCacheKey);
+
+        // Get all ChatBot cache keys that depend on this MCP
+        Set<String> chatBotKeys = toolDependencies.remove(mcpCacheKey);
+
+        if (CollectionUtils.isEmpty(chatBotKeys)) {
+            log.debug("No ChatBots depend on MCP key, cacheKey={}", mcpCacheKey);
+            return;
+        }
+
+        // Invalidate all dependent ChatBots directly from cache
+        for (String cacheKey : chatBotKeys) {
+            chatBotCache.invalidate(cacheKey);
+        }
+
+        log.info(
+                "Invalidated ChatBots for MCP key, chatBotCount={}, cacheKey={}",
+                chatBotKeys.size(),
+                mcpCacheKey);
+    }
+
+    /**
+     * Build cache key from session info, model endpoint and credentials
+     *
+     * @param request chat request containing configuration
+     * @return MD5 hashed cache key
+     */
+    private String buildCacheKey(LlmChatRequest request) {
+        StringBuilder sb = new StringBuilder();
+
+        // Session ID (for ChatBot isolation)
+        sb.append("session:").append(request.getSessionId()).append("|");
+
+        // Product ID (for Product isolation)
+        sb.append("product:").append(request.getProduct().getProductId()).append("|");
+
+        // Thinking mode changes the model instance configuration.
+        sb.append("thinking:").append(request.isEnableThinking()).append("|");
+
+        // Model URL (scheme + host + port + path)
+        if (request.getUri() != null) {
+            sb.append("url:")
+                    .append(request.getUri().getScheme())
+                    .append("://")
+                    .append(request.getUri().getHost());
+
+            if (request.getUri().getPort() > 0) {
+                sb.append(":").append(request.getUri().getPort());
+            }
+
+            if (Strings.isNotBlank(request.getUri().getPath())) {
+                sb.append(request.getUri().getPath());
+            }
+
+            sb.append("|");
+        } else {
+            sb.append("url:none|");
+        }
+
+        // Credentials (API Key + Headers + Query Params)
+        sb.append("cred:");
+
+        // API Key
+        if (Strings.isNotBlank(request.getApiKey())) {
+            sb.append("apiKey=").append(request.getApiKey()).append(",");
+        }
+
+        // Headers (sorted)
+        if (request.getHeaders() != null && !request.getHeaders().isEmpty()) {
+            sb.append("headers={");
+            request.getHeaders().entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey())
+                    .forEach(
+                            entry ->
+                                    sb.append(entry.getKey())
+                                            .append("=")
+                                            .append(entry.getValue())
+                                            .append(","));
+            sb.append("},");
+        }
+
+        // Query Params (sorted)
+        if (request.getQueryParams() != null && !request.getQueryParams().isEmpty()) {
+            sb.append("params={");
+            request.getQueryParams().entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey())
+                    .forEach(
+                            entry ->
+                                    sb.append(entry.getKey())
+                                            .append("=")
+                                            .append(entry.getValue())
+                                            .append(","));
+            sb.append("}");
+        }
+
+        sb.append("|");
+
+        // Body Params (sorted)
+        if (request.getBodyParams() != null && !request.getBodyParams().isEmpty()) {
+            sb.append("body:{");
+            request.getBodyParams().entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey())
+                    .forEach(
+                            entry ->
+                                    sb.append(entry.getKey())
+                                            .append("=")
+                                            .append(entry.getValue())
+                                            .append(","));
+            sb.append("}|");
+        }
+
+        // MCP tool cache keys (sorted)
+        sb.append("mcp:");
+        if (!CollectionUtils.isEmpty(request.getMcpConfigs())) {
+            String mcpKeys =
+                    request.getMcpConfigs().stream()
+                            .map(toolManager::buildCacheKey)
+                            .filter(Strings::isNotBlank)
+                            .sorted()
+                            .collect(Collectors.joining(","));
+            sb.append(mcpKeys);
+        } else {
+            sb.append("none");
+        }
+
+        // Hash the final string for fixed-length cache key
+        String rawKey = sb.toString();
+
+        return "chatBot:" + DigestUtils.md5DigestAsHex(rawKey.getBytes(StandardCharsets.UTF_8));
+    }
+}

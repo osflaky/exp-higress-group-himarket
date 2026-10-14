@@ -1,0 +1,16 @@
+{
+  "chat": {
+    "subtitle": "选择模型，开始自然、连续的智能对话",
+    "cta": "登录后开始对话",
+    "placeholder": "登录后，向模型发送一条消息...",
+    "loginHint": "登录后可选择模型并使用 MCP 工具"
+  },
+  "coding": {
+    "subtitle": "描述目标，让 Agent 在沙箱中编写、运行并迭代代码",
+    "cta": "登录后开始编码",
+    "placeholder": "登录后，描述你想实现的功能...",
+    "loginHint": "登录后可选择模型、Skill 与 MCP 工具",
+    "workspace": "沙箱工作区"
+  },
+  "register": "注册新账号"
+}
